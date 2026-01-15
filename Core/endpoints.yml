@@ -1,0 +1,2 @@
+action_endpoint:
+  url: "http://lacanian-actions.fly.dev/webhook"

@@ -1,0 +1,12 @@
+fly.toml
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+.env
+.env.*
+.DS_Store
+.git
+.gitignore

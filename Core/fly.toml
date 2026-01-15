@@ -1,0 +1,36 @@
+# fly.toml - configuration for lacanian-bot
+app = "lacanian-bot"
+primary_region = "ams"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[processes]
+  app = "./start.sh"
+
+# Service for the main Rasa bot (port 5005)
+[[services]]
+  # Tie this HTTP service to the "app" process
+  processes = ["app"]
+  internal_port = 5005
+  protocol = "tcp"
+  force_https = true
+
+  # Public ports and handlers for the Rasa bot
+  [[services.ports]]
+    port = 80
+    handlers = ["http"]
+
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]
+
+  [services.concurrency]
+    type = "connections"
+    soft_limit = 20
+    hard_limit = 25
+
+[[vm]]
+  memory = "1gb"
+  cpu_kind = "shared"
+  cpus = 1

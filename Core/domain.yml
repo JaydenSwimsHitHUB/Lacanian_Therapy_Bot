@@ -1,0 +1,54 @@
+version: "3.1"
+
+intents:
+  - start
+  - user_message
+  - placeholder_intent
+  - nlu_fallback
+  - restart
+
+responses:
+  utter_start:
+    - text: "So what's on your heart? Speak freely and tell me everything that comes to mind."
+  utter_fallback:
+    - text: "..."
+
+actions:
+  - action_analyze_message
+  - action_session_start_custom
+
+slots:
+  session_thematic_count:
+    type: float
+    initial_value: 0
+    influence_conversation: false
+    mappings:
+      - type: custom
+
+  last_mechanism:
+    type: text
+    influence_conversation: false
+    mappings:
+      - type: custom
+
+  cut_trigger:
+    type: text
+    influence_conversation: false
+    mappings:
+      - type: custom
+
+  cut_trigger_source:
+    type: text
+    influence_conversation: false
+    mappings:
+      - type: custom
+
+  mechanism_counts:
+    type: any
+    influence_conversation: false
+    mappings:
+      - type: custom
+
+session_config:
+  session_expiration_time: 30  # minutes of silence before a new session
+  carry_over_slots_to_new_session: false

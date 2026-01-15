@@ -1,0 +1,43 @@
+version: "3.1"
+
+nlu:
+
+- intent: start
+  examples: |
+    - /start
+
+- intent: user_message
+  examples: |
+    - Hi there.
+    - How are you?
+    - Hello!
+    - I was walking down the road when I saw a cow.
+    - I know it's wrong, but I still want it.
+    - It all seems pointless, yet I try.
+    - I feel like giving up but something stops me.
+    - The truth is a lie.
+    - Pain and pleasure are the same.
+    - The sky is not blue but red.
+    - I question my own question.
+    - Nothing matters, although everything matters.
+    - I really don't want to tell my mother I love her.
+    - I can't say I love her.
+    - I feel uncomfortable saying I love my mom.
+    - Why do I feel blocked when I try to express love?
+    - I feel something but I can't say it.
+    - I want to love her, but I resist.
+    - Still, I try.
+    - I hate that I want this.
+    - It makes no sense.
+    - I want it, even if it's wrong.
+    - Is it wrong to want this?
+    - I don't know
+    - Maybe...
+    - What do you think?
+    - It just keeps happening.
+    - I said it but I didn’t mean it.
+    - Say something! 
+    - I hate you.
+    - I want you to speak! 
+    
+

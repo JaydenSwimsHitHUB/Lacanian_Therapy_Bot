@@ -1,0 +1,18 @@
+language: en
+recipe: default.v1
+
+pipeline:
+- name: WhitespaceTokenizer
+- name: CountVectorsFeaturizer
+- name: DIETClassifier
+  intent_classification: true
+- name: FallbackClassifier
+  threshold: 0.7
+  ambiguity_threshold: 0.1
+
+policies:
+- name: RulePolicy
+  core_fallback_threshold: 0.3
+  core_fallback_action_name: "utter_fallback"
+  enable_fallback_prediction: true
+assistant_id: 20250526-174909-cyclic-graph

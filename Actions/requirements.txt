@@ -1,0 +1,5 @@
+numpy==1.23.5
+openai==1.93.0
+rasa_sdk==3.12.1
+spacy==3.8.7
+gunicorn==20.1.0
