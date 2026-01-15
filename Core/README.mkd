@@ -3,12 +3,8 @@
 This is a Lacanian discourse analyst bot deployed via Fly.io and running on Telegram. 
 
 ## Features
-- Detects Lacanian defense mechanisms in user messages
-- Identifies cut triggers and thematic markers
+- Detects Lacanian defense mechanisms in user messages and responds accordingly
+- Identifies cut triggers and ends the session at a crucial moment 
 - Responds using psychoanalytic logic and ambiguity
 
-## Running Locally
-```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
+
