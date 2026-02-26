@@ -11,6 +11,8 @@ primary_region = "ams"
   processes = ["app"]
   internal_port = 5055
   protocol = "tcp"
+  auto_stop_machines = "off"
+  auto_start_machines = true
 
   [[services.ports]]
     port = 80
