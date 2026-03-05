@@ -36,7 +36,8 @@ def run_server():
         "--enable-api", 
         "--cors", "*", 
         "--port", "5005", 
-        "--interface", "0.0.0.0"
+        "--interface", "0.0.0.0",
+        "--debug"  # Generates continuous internal activity markers
     ]
     
     # Launch Rasa as a child process, capturing stdout and stderr combined
@@ -52,14 +53,23 @@ def run_server():
     monitor_thread = threading.Thread(target=timeout_checker, args=(proc,), daemon=True)
     monitor_thread.start()
 
+    # Define the signifiers that are permitted to bypass the output filter
+    manifest_keywords = [
+        "Rasa server is up", 
+        "Received user message", 
+        "ERROR", 
+        "WARNING"
+    ]
+
     # Iterate continuously over the child process's output
     for line in iter(proc.stdout.readline, ''):
         with state_lock:
             last_activity = time.time()
             
-        # Pipe the log line to the standard Docker output for Fly.io logging
-        sys.stdout.write(line)
-        sys.stdout.flush()
+        # Conditionally manifest the log line to stdout
+        if any(keyword in line for keyword in manifest_keywords):
+            sys.stdout.write(line)
+            sys.stdout.flush()
         
     proc.wait()
     os._exit(0)

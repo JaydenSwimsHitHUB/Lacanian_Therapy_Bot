@@ -3,9 +3,7 @@ import os
 import re
 import random
 import sqlite3
-import logging
 import asyncio
-import sys
 import threading  # <--- NEW: For the synchronous timer
 from typing import Any, Text, Dict, List, Optional, Tuple
 
@@ -14,16 +12,12 @@ from rasa_sdk import Action, Tracker
 from rasa_sdk.executor import CollectingDispatcher
 from rasa_sdk.events import SlotSet, SessionStarted, ActionExecuted, EventType
 
-# Quiet noisy loggers (optional)
-for _name in ["rasa", "rasa.core", "rasa_sdk", "urllib3"]:
-    logging.getLogger(_name).setLevel(logging.WARNING)
-
 # --- SETUP CLIENT FOR DEEPSEEK R1 / COMPATIBLE PROVIDER ---
 api_key = os.getenv("OPENAI_API_KEY")
 base_url = os.getenv("API_BASE_URL", "https://api.deepinfra.com/v1/openai") 
 
 if not api_key:
-    logging.warning("OPENAI_API_KEY environment variable not set")
+    pass
 
 if api_key:
     async_client = AsyncOpenAI(api_key=api_key, base_url=base_url)
@@ -39,7 +33,6 @@ TOTAL_PROMPT_CHAR_LIMIT = 32000
 PRIOR_HISTORY_TOKEN = "__PRIOR_HISTORY__"
 TRUNCATION_MARKER = "...(truncated)\n"
 
-
 # --- HISTORY / DB SETUP ---
 DB_PATH = os.getenv("CHAT_DB_PATH", "/app/persistent/chat_history.db")
 dir_path = os.path.dirname(DB_PATH)
@@ -54,24 +47,48 @@ def insert_user_message(conn: sqlite3.Connection, user_id: str, message: str) ->
     )
     conn.commit()
 
+def get_prior_history_messages(conn: sqlite3.Connection, user_id: str) -> List[str]:
+    cursor = conn.execute(
+        "SELECT message FROM user_messages WHERE user_id = ? ORDER BY timestamp ASC, id ASC",
+        (user_id,)
+    )
+    return [row[0] for row in cursor.fetchall()]
+
+def get_master_signifier_history(conn: sqlite3.Connection, user_id: str) -> List[str]:
+    cursor = conn.execute(
+        "SELECT signifier FROM master_signifiers WHERE user_id = ? ORDER BY timestamp ASC, id ASC",
+        (user_id,)
+    )
+    return [row[0] for row in cursor.fetchall()]
+
+def _insert_master_signifier(conn: sqlite3.Connection, user_id: str, signifier: str, phrase: str) -> None:
+    cursor = conn.execute(
+        "SELECT 1 FROM master_signifiers WHERE user_id = ? AND signifier = ? LIMIT 1",
+        (user_id, signifier)
+    )
+    if cursor.fetchone() is None:
+        conn.execute(
+            "INSERT INTO master_signifiers (user_id, signifier, phrase) VALUES (?, ?, ?)",
+            (user_id, signifier, phrase)
+        )
+        conn.commit()
+
+
 # --- UTILITY: ROBUST JSON EXTRACTION ---
 def _extract_json(content: str) -> Dict[str, Any]:
     try:
         return json.loads(content)
     except json.JSONDecodeError:
         pass
-
     text = content
-    text = re.sub(r"```(?:json)?\n|```", "", text)
+    text = re.sub(r"`{3}(?:json)?\n|`{3}", "", text)
     start_index = None
     for i, ch in enumerate(text):
         if ch == "{":
             start_index = i
             break
-
     if start_index is None:
         return {}
-
     depth = 0
     for j in range(start_index, len(text)):
         if text[j] == "{":
@@ -84,16 +101,13 @@ def _extract_json(content: str) -> Dict[str, Any]:
                     return json.loads(candidate)
                 except json.JSONDecodeError:
                     break
-
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if match:
         try:
             return json.loads(match.group(0))
         except json.JSONDecodeError:
             return {}
-
     return {}
-
 
 # ---------------------------
 
@@ -122,11 +136,7 @@ response_matrix: Dict[str, Dict[int, Optional[str]]] = {
 ALLOWED_MECHANISMS = set(response_matrix.keys())
 
 CUT_TRIGGERS = [
-    "marked_signifier_collapse",
     "major_shift_retroactive",
-    "point_of_maximal_ambiguity",
-    "return_of_repressed_master_signifier",
-    "omission_missing_signifier",
 ]
 
 
@@ -203,18 +213,17 @@ def _get_session_user_turn_count(tracker: Tracker) -> int:
 
 def build_cut_detection_prompt(
     new_input: str,
-    tracker: Tracker,
+    raw_history: str,
     prior_history_str: str,
     master_signifier_history: str = "",
 ) -> str:
-    raw_history = _get_session_history_text(tracker)
     cuts = CUT_TRIGGERS
 
     template = f"""
 You are a Lacanian analyst waiting to perform SCANSION, an abrupt session end (Cut) at a worthy time to produce Retroactive Meaning (après-coup).
 
 # Scanning Algorithm
-1. Chronological Scan: Read <prior_history>, then <master_signifier_history>, then <raw_history>, then <new_input>, from left to right. 
+1. Chronological Scan: Read <master_signifier_history>, then <prior_history>, then <raw_history>, then <new_input>, from left to right. 
 2. Identify cut_trigger: Scan for a cut_trigger in <new_input> based on the definitions of the cut triggers below.
 3. Identify S1: First signifier of rupture = identified_s1.
 
@@ -222,7 +231,7 @@ You are a Lacanian analyst waiting to perform SCANSION, an abrupt session end (C
 - major_shift_retroactive: A sudden rupture in the Automaton. The user has been speaking in a well established Imaginary 'script' with predictable signifiers (ego-level discourse), and suddenly a signifier intrudes that is probabilistically very unlikely and therefore ruptures the ego-level discourse. The intruder is identified_s1. 
 
 # Constraints:
-- You CANNOT cut if it is even slightly unclear what the ego-level script is. The script must be very well established with mula battery of signifiers that clearly point to a specific ego-level discourse.
+- You CANNOT cut if it is even slightly unclear what the ego-level script is. The script must be very well established with a battery of signifiers that clearly point to a specific ego-level discourse.
 
 # Master Signifier (S1) History
 {master_signifier_history}
@@ -258,9 +267,10 @@ You are a Lacanian analyst. We have identified a rupture on the signifier: "{ide
 # CRITICAL RULES
 1. IDENTIFY S1: Take the `identified_s1` as S1.
 2. CONSTRUCT CUT: In `cut_phrase`, rewrite the user's NEW input *up to and including* that S1.
-   Embolden the S1.
-   Do NOT include any text after the S1.
-   Follow it immediately with a new paragraph and the exact string "We are ending there."
+   a) Embolden the S1.
+   b) Do NOT include any text after the S1.
+   c) Extract the final phrase that ends with the S1. The phrase can be an ambiguous fragment, or a logical sentence, as long as it ends with the identified S1. It must NOT be longer than 10 words.
+   d) Follow it immediately with a new paragraph and the exact string "We are ending there."
    
 # EXAMPLE
    - Example Input: "I felt so yellow I mean blue after he left, I just wanted to cry."
@@ -339,7 +349,6 @@ class ActionAnalyzeMessage(Action):
 
     def _shutdown_server(self):
         """The callback function that runs when the timer expires."""
-        logging.warning(f"Machine idle for {self.idle_timeout}s. Initiating shutdown via os._exit(0).")
         # Force immediate exit. Fly.io will see the process die.
         os._exit(0)
 
@@ -347,7 +356,6 @@ class ActionAnalyzeMessage(Action):
         """Cancels any existing timer and starts a new one in a separate thread."""
         if self.shutdown_timer:
             self.shutdown_timer.cancel()
-        
         # Create a new Timer that calls _shutdown_server after idle_timeout
         self.shutdown_timer = threading.Timer(self.idle_timeout, self._shutdown_server)
         self.shutdown_timer.daemon = True # Daemon thread exits if main program exits
@@ -372,8 +380,7 @@ class ActionAnalyzeMessage(Action):
                 temperature=0.1,
             )
             return _extract_json(resp.choices[0].message.content.strip())
-        except Exception as e:
-            logging.error(f"Mechanism API call failed: {e}")
+        except Exception:
             return {}
 
     async def _call_scansion_api(self, scansion_prompt: str) -> Dict[str, Any]:
@@ -387,8 +394,7 @@ class ActionAnalyzeMessage(Action):
                 max_tokens=600,
             )
             return _extract_json(resp.choices[0].message.content.strip())
-        except Exception as e:
-            logging.error(f"Scansion API call failed: {e}")
+        except Exception:
             return {}
 
     async def _get_responses_parallel_async(self, mech_prompt: str, scansion_prompt: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
@@ -398,8 +404,7 @@ class ActionAnalyzeMessage(Action):
                 self._call_scansion_api(scansion_prompt)
             )
             return data1, data2
-        except Exception as e:
-            logging.error(f"Async parallel calls failed: {e}")
+        except Exception:
             return {}, {}
 
     async def _fallback_responses_async(self, mech_prompt: str, scansion_prompt: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
@@ -420,8 +425,7 @@ class ActionAnalyzeMessage(Action):
                 )
             )
             return _extract_json(data1.choices[0].message.content.strip()), _extract_json(data2.choices[0].message.content.strip())
-        except Exception as e:
-            logging.error(f"Fallback async calls failed: {e}")
+        except Exception:
             return {}, {}
     
     async def _cut_construction_async(self, prompt2b: str) -> Optional[str]:
@@ -435,8 +439,7 @@ class ActionAnalyzeMessage(Action):
             )
             data2b = _extract_json(resp.choices[0].message.content.strip())
             return data2b.get("cut_phrase")
-        except Exception as e:
-            logging.error(f"Cut construction failed: {e}")
+        except Exception:
             return None
 
     async def run(
@@ -445,55 +448,41 @@ class ActionAnalyzeMessage(Action):
         tracker: Tracker,
         domain: Dict[Text, Any],
     ) -> List[EventType]:
-        
         # --- TIMER RESET ---
         # We received a message, so reset the 30-minute idle timer using threading
         self._reset_timer()
-
         user_id = tracker.sender_id
         user_input = (tracker.latest_message.get("text", "") if tracker.latest_message else "").strip()
-
-        # Retrieve prior history from the database for this user
-        def get_prior_history_messages(conn, user_id):
-            cursor = conn.execute(
-                "SELECT message FROM user_messages WHERE user_id = ? ORDER BY timestamp ASC, id ASC",
-                (user_id,)
-            )
-            return [row[0] for row in cursor.fetchall()]
-
-        prior_history_messages = get_prior_history_messages(self.conn, user_id)
-        prior_history = "\n".join(f"- {msg}" for msg in prior_history_messages)
         
-        def get_master_signifier_history(conn, user_id):
-            cursor = conn.execute(
-                "SELECT signifier FROM master_signifiers WHERE user_id = ? ORDER BY timestamp ASC, id ASC",
-                (user_id,)
-            )
-            return [row[0] for row in cursor.fetchall()]
-        master_signifiers = get_master_signifier_history(self.conn, user_id)
-        master_signifier_history = "\n".join(f"* {s}" for s in master_signifiers)
-
-
-        # --- MODIFIED: Add therapist logic for the first 3 turns ---
+        # Precompute state to prevent redundant O(N) traversals
         user_turn_count = _get_session_user_turn_count(tracker)
+        raw_history_text = _get_session_history_text(tracker)
 
-        if user_turn_count <= 3:
-            initial_response = await self._generate_initial_therapeutic_response(user_input, tracker, prior_history)
-            dispatcher.utter_message(text=initial_response)
-
-            if user_input:
-                insert_user_message(self.conn, user_id, user_input)
-            return []
+        # Retrieve prior history from the database using background threads to avoid blocking the event loop
+        prior_history_messages, master_signifiers = await asyncio.gather(
+            asyncio.to_thread(get_prior_history_messages, self.conn, user_id),
+            asyncio.to_thread(get_master_signifier_history, self.conn, user_id)
+        )
+        prior_history = "\n".join(f"- {msg}" for msg in prior_history_messages)
+        master_signifier_history = "\n".join(f"* {s}" for s in master_signifiers)
         
+        # Asynchronously store user message to avoid sequential latency
+        if user_input:
+            asyncio.create_task(asyncio.to_thread(insert_user_message, self.conn, user_id, user_input))
+        
+        # --- MODIFIED: Add therapist logic for the first 3 turns ---
+        if user_turn_count <= 3:
+            initial_response = await self._generate_initial_therapeutic_response(user_input, raw_history_text, prior_history)
+            dispatcher.utter_message(text=initial_response)
+            return []
+            
         low = user_input.lower()
         if low == "/stop" or "i want to stop" in low:
             dispatcher.utter_message(text="...")
             return []
-
+            
         # ==== PASS 1: Local mechanism identification ===#
-        raw_history_mech = _get_session_history_text(tracker)
         allowed = list(ALLOWED_MECHANISMS)
-
         mech_template = (
             "You are a Lacanian analyst. Identify the single most structuring mechanism in the user's NEW input by examining the NEW message and the signifying chain (The current session's history as well as the prior sessions' history).\n\n"
             "Use the NEW message and the signifying chain (message history) to help you decide.\n"
@@ -517,11 +506,11 @@ class ActionAnalyzeMessage(Action):
             "Master Signifier (S1) History (previously identified S1s for this user):\n"
             f"{master_signifier_history}\n\n"
             "Raw recent dialogue:\n"
-            f"{raw_history_mech}\n\n"
+            f"{raw_history_text}\n\n"
             "Prior (Long Term) history:\n"
             f"{PRIOR_HISTORY_TOKEN}\n\n"
             "NEW user input:\n"
-            f"\"{user_input}\"\n\n"
+            f'"{user_input}"\n\n'
             "RULE: If and only if you select \"master_signifier\" as the mechanism, you MUST also return the specific anchoring signifier in the \"master_signifier\" field. Otherwise leave it null.\n\n"
             "Respond in strict JSON:\n"
             "{\n"
@@ -535,65 +524,47 @@ class ActionAnalyzeMessage(Action):
         mech_prompt = _apply_prior_history_limit(mech_template, prior_history, TOTAL_PROMPT_CHAR_LIMIT)
         
         # ==== PASS 1 & 2a: PARALLEL CALLS FOR SPEED ===#
-        
         # --- PASS 2a: Detection (With Long Term History) ---
-        prompt2a = build_cut_detection_prompt(user_input, tracker, prior_history, master_signifier_history)
-
+        prompt2a = build_cut_detection_prompt(user_input, raw_history_text, prior_history, master_signifier_history)
         data1, data2 = await self._get_responses_parallel_async(mech_prompt, prompt2a)
         
         if not data1 and not data2:
-            logging.warning("Both API calls failed, using fallback responses")
             data1, data2 = await self._fallback_responses_async(mech_prompt, prompt2a)
-        
+            
         mech: Optional[str] = data1.get("mechanism")
         mech_phrase: Optional[str] = data1.get("mechanism_phrase")
         detected_s1: Optional[str] = data1.get("master_signifier")
-
+        
         if not detected_s1 and mech == "master_signifier" and mech_phrase:
             detected_s1 = mech_phrase
             
         if detected_s1 and isinstance(detected_s1, str) and detected_s1.strip():
             s1_clean = detected_s1.strip()
-            cursor = self.conn.execute(
-                "SELECT 1 FROM master_signifiers WHERE user_id = ? AND signifier = ? LIMIT 1",
-                (user_id, s1_clean)
-            )
-            if cursor.fetchone() is None:
-                self.conn.execute(
-                    "INSERT INTO master_signifiers (user_id, signifier, phrase) VALUES (?, ?, ?)",
-                    (user_id, s1_clean, mech_phrase or "")
-                )
-                self.conn.commit()
+            # Asynchronously archive new master signifier
+            asyncio.create_task(asyncio.to_thread(_insert_master_signifier, self.conn, user_id, s1_clean, mech_phrase or ""))
 
         # ==== PASS 2: Potential Cut Trigger Identification ===#
         potential_trigger: Optional[str] = data2.get("cut_trigger")
         identified_s1: Optional[str] = data2.get("identified_s1")
         potential_trigger_phrase: Optional[str] = None
-
+        
         if potential_trigger and potential_trigger in CUT_TRIGGERS and identified_s1:
             prompt2b = build_cut_construction_prompt(user_input, identified_s1)
             potential_trigger_phrase = await self._cut_construction_async(prompt2b)
-        
+            
         data2["cut_phrase"] = potential_trigger_phrase
-
+        
         # ==== PASS 3: Cut Verification ===#
         verified_trigger: Optional[str] = None
         if potential_trigger and potential_trigger in CUT_TRIGGERS:
-            user_turn_count = _get_session_user_turn_count(tracker)
             if user_turn_count < 7:
                 verified_trigger = None 
             else:
                 verified_trigger = potential_trigger
-
+                
         final_trigger_phrase = potential_trigger_phrase if verified_trigger else None
         if isinstance(final_trigger_phrase, str):
             final_trigger_phrase = final_trigger_phrase.strip('"\'')
-
-        logging.info("DETECTIONS: mechanism=%s, cut_trigger=%s, verified=%s, s1=%s",
-                     mech or "", potential_trigger or "", verified_trigger or "", detected_s1 or "")
-
-        if user_input:
-            insert_user_message(self.conn, user_id, user_input)
 
         if verified_trigger:
             say = final_trigger_phrase if final_trigger_phrase else "We are ending there."
@@ -603,10 +574,10 @@ class ActionAnalyzeMessage(Action):
                 SlotSet("last_mechanism", None),
                 SlotSet("mechanism_counts", None),
             ]
-
+            
         if mech in ALLOWED_MECHANISMS:
             counts, cnt = self._update_mechanism_counts(tracker, mech)
-            text = await self.handle_mechanism(mech, cnt, user_input, mech_phrase, tracker, prior_history, master_signifier_history)
+            text = await self.handle_mechanism(mech, cnt, user_input, mech_phrase, raw_history_text, prior_history, master_signifier_history)
             dispatcher.utter_message(text=text)
             return [
                 SlotSet("last_mechanism", mech),
@@ -617,7 +588,7 @@ class ActionAnalyzeMessage(Action):
                     (tracker.get_slot("session_thematic_count") or 0) + 1,
                 ),
             ]
-
+            
         dispatcher.utter_message(text="...")
         return [
             SlotSet("last_mechanism", None),
@@ -629,8 +600,7 @@ class ActionAnalyzeMessage(Action):
             ),
         ]
 
-    async def _generate_initial_therapeutic_response(self, user_input: str, tracker: Tracker, prior_history: str) -> str:
-        history = _get_session_history_text(tracker)
+    async def _generate_initial_therapeutic_response(self, user_input: str, raw_history: str, prior_history: str) -> str:
         prompt_template = (
             "You are an insightful and empathetic therapist. Your goal for these initial sessions is to build rapport and hope by offering interpretations and mirroring that feel deeply personal to the user, even though they are based on universal psychological principles. This is a technique to make the user feel seen and understood, encouraging them to open up.\n\n"
             "GUIDELINES:\n"
@@ -643,7 +613,7 @@ class ActionAnalyzeMessage(Action):
             "PRIOR SESSION HISTORY (Long Term):\n" 
             f"{PRIOR_HISTORY_TOKEN}\n\n"
             "SESSION HISTORY:\n"
-            f"{history}\n\n"
+            f"{raw_history}\n\n"
             "USER'S LATEST MESSAGE:\n"
             f'"{user_input}"\n\n'
             "Craft your insightful, universally applicable therapeutic interpretation based on the entire conversation."
@@ -652,8 +622,7 @@ class ActionAnalyzeMessage(Action):
         try:
             response_text = await self._generate_initial_response_async(prompt)
             return response_text
-        except Exception as e:
-            logging.error(f"Error generating initial therapeutic response: {e}")
+        except Exception:
             return "That's a very important point. It makes sense to feel that way. Please, continue."
     
     async def _generate_initial_response_async(self, prompt: str) -> str:
@@ -676,7 +645,7 @@ class ActionAnalyzeMessage(Action):
         count: int,
         user_input: str,
         phrase: Optional[str],
-        tracker: Tracker,
+        raw_history: str,
         prior_history: str, 
         master_signifier_history: str = "",
         ) -> str:
@@ -685,17 +654,17 @@ class ActionAnalyzeMessage(Action):
         intervention = responses.get(count)
 
         if mechanism == "denial" and (count == 1 or count == 3):
-            return await self._gpt_denial_intervention(user_input, tracker, prior_history, master_signifier_history)
+            return await self._gpt_denial_intervention(user_input, raw_history, prior_history, master_signifier_history)
         if intervention == "<gpt_metonymy>":
-            return await self._gpt_metonymy_intervention(user_input, tracker, prior_history, master_signifier_history)
+            return await self._gpt_metonymy_intervention(user_input, raw_history, prior_history, master_signifier_history)
         if intervention == "<gpt_identification>":
-            return await self._gpt_identification_intervention(user_input, tracker)
+            return await self._gpt_identification_intervention(user_input)
         if intervention == "<gpt_ambiguity>":
-            return await self._gpt_ambiguity_intervention(user_input, tracker)
+            return await self._gpt_ambiguity_intervention(user_input)
         if mechanism == "master_signifier" and (count == 1 or count == 3):
-            return await self._gpt_quilting_point_echo(user_input, tracker, prior_history)
+            return await self._gpt_quilting_point_echo(user_input, raw_history, prior_history)
         if intervention == "<oracle>":
-            return await self._generate_oracular_equivoque(user_input, tracker)
+            return await self._generate_oracular_equivoque(user_input)
         if intervention:
             if count == 2 and mechanism in {"repression", "jouissance", "metaphor"}:
                 return random.choice(INTERJECTION_CHOICES)
@@ -703,18 +672,17 @@ class ActionAnalyzeMessage(Action):
 
         return "..."
 
-    async def _gpt_metonymy_intervention(self, user_input: str, tracker: Tracker, prior_history: str, master_signifier_history: str = "") -> str:
+    async def _gpt_metonymy_intervention(self, user_input: str, raw_history: str, prior_history: str, master_signifier_history: str = "") -> str:
         if not async_client:
             return "..."
-        history = _get_session_history_text(tracker)
         system_msg = (
             "You are a Lacanian analyst. The user is exhibiting METONYMY: an endless sliding of meaning (displacement, running from topic to topic, inability to conclude).\n"
-            "Your task is to produce a 'Point de Capiton' (Quilting Point). You must STOP the sliding by isolating a single signifier or short phrase that anchors the nonsense.\n"
+            "Your task is to produce a 'Point de Capiton' (Quilting Point). You must STOP the sliding by isolating a single signifier that anchors the nonsense.\n"
             "Rules:\n"
             "1. Read the history to identify what the user is sliding AWAY from.\n"
             "2. Select one specific word/phrase from the User's text (current or recent) that acts as the anchor.\n"
             "3. Return ONLY that word/phrase with a period to denote finality/anchoring.\n"
-            "4. Do NOT explain or ask a question. Be authoritative but cryptic."
+            "4. Do NOT explain or ask a question."
         )
         user_msg_template = (
             "Master Signifier (S1) History:\n"
@@ -722,7 +690,7 @@ class ActionAnalyzeMessage(Action):
             "Prior History:\n"
             f"{PRIOR_HISTORY_TOKEN}\n\n"
             "History:\n"
-            f"{history}\n\n"
+            f"{raw_history}\n\n"
             f"Current Input: \"{user_input}\"\n\n"
             "Output the Quilting Point:"
         )
@@ -747,7 +715,7 @@ class ActionAnalyzeMessage(Action):
         except Exception:
             return "..."        
     
-    async def _gpt_identification_intervention(self, user_input: str, tracker: Tracker) -> str:
+    async def _gpt_identification_intervention(self, user_input: str) -> str:
         if not async_client:
             return "Who?"
         system_msg = (
@@ -781,7 +749,7 @@ class ActionAnalyzeMessage(Action):
         except Exception:
             return "Who?"
 
-    async def _gpt_ambiguity_intervention(self, user_input: str, tracker: Tracker) -> str:
+    async def _gpt_ambiguity_intervention(self, user_input: str) -> str:
         if not async_client:
             return "?"
         system_msg = (
@@ -812,10 +780,9 @@ class ActionAnalyzeMessage(Action):
         except Exception:
             return "?"
 
-    async def _gpt_denial_intervention(self, text: str, tracker: Tracker, prior_history: str, master_signifier_history: str = "") -> str:
+    async def _gpt_denial_intervention(self, text: str, raw_history: str, prior_history: str, master_signifier_history: str = "") -> str:
         if not async_client:
             return "..."
-        history = _get_session_history_text(tracker)
         system_msg = (
             "You are a Lacanian analyst. Produce ONE Bruce Fink-style intervention in response to DENIAL. "
             "Rules: (1) Read the full user text and history and locate the strongest, most meaningful denial phrase in the NEW input (negations that are related to key denied signifiers and are in forms such as don't, can't, won't, "
@@ -837,7 +804,7 @@ class ActionAnalyzeMessage(Action):
             "Prior History:\n"
             f"{PRIOR_HISTORY_TOKEN}\n\n"
             "Session History:\n"
-            f"{history}\n\n"
+            f"{raw_history}\n\n"
             "User text:\n"
             f"{text}\n\n"
             "Return only the single intervention line."
@@ -879,7 +846,7 @@ class ActionAnalyzeMessage(Action):
             text += '.'
         return text
 
-    async def _generate_oracular_equivoque(self, text: str, tracker: Tracker) -> str:
+    async def _generate_oracular_equivoque(self, text: str) -> str:
         if not async_client:
             return "..."
         prompt = (
@@ -893,11 +860,11 @@ class ActionAnalyzeMessage(Action):
             "that seems most ambiguous.\n\n"
             "STEP 2: THE CHAIN: Convert ONLY that phrase into an unbroken IPA string.\n\n"
             "STEP 3: THE ÉQUIVOQUE: Re-segment the IPA string by moving the word boundaries to "
-            "reveal just a few NEW words. This must result in a 1-8 word English phrase that sounds very similar "
-            "to the original but means something different. It may use some of the original words.\n\n"
+            "reveal just a few NEW words. This must result in a 1-8 word English phrase that sounds similar "
+            "to the original but means something different. It may use some of the original words. You can try a maximum of three variations. If you cannot find a suitable variation, return silence (...).\n\n"
             "STEP 4: THE EDIT: If the new phrase does not make ANY sense, do the following:\n"
-            "- Remove words from the beginning or end, one at a time, and check if the phrase is surprising, playful and polyvalent and contains at least one changed word from the original.\n"
-            "- If you cannot make such a phrase, use the single most changed word that is closest in sound to the original.\n\n"
+            "- Remove words from the beginning or end, one at a time, and check if the phrase/signifier is surprising, playful and polyvalent and contains at least one changed word from the original.\n"
+            "- Do NOT try more than three variations.\n"
             "- If the final product is still not surprising, polyvalent, and provocative, return silence (...).\n\n"
             "WORK THROUGH EACH STEP LOUDLY.\n\n"
             "CITATION: <Your final 1-8 word phrase.>. No bold, no quotes, etc., just the phrase with proper capitalization and a period at the end."
@@ -910,7 +877,6 @@ class ActionAnalyzeMessage(Action):
                 max_tokens=1000,
             )
             raw = response.choices[0].message.content.strip()
-            logging.info("[ORACULAR LLM OUTPUT] Raw output and working:\n%s", raw)
             citation_match = re.search(r"CITATION:\s*(.+)", raw, re.IGNORECASE)
             if citation_match:
                 line = citation_match.group(1).strip()
@@ -928,18 +894,16 @@ class ActionAnalyzeMessage(Action):
                 return self._format_citation(line) if line else "..."
             return "..."
         except Exception:
-            logging.exception("[ORACULAR LLM OUTPUT] Exception during oracular LLM call:")
             return "..."
     
     async def _gpt_quilting_point_echo(
         self,
         user_input: str,
-        tracker: Tracker,
+        raw_history: str,
         prior_history: str,
     ) -> str:
         if not async_client:
             return "..."
-        history = _get_session_history_text(tracker)
         prompt_template = (
             "You are a Lacanian analyst. Select the Master Signifier (S1) from the NEW user input by examinning it in the context of the full discourse history. "
             "This is a signifier that supposes to be a fundamental authoritative, absolute fact that stabilizes the subject's identity or discourse. It is a 'just because' signifier that stops the endless sliding of meaning.\n\n"
@@ -947,7 +911,7 @@ class ActionAnalyzeMessage(Action):
             "- Extract the text verbatim.\n"
             "- Output format: Signifier... (First word capitalized, no quotes).\n\n"
             f"Prior History:\n{PRIOR_HISTORY_TOKEN}\n\n" 
-            f"Recent dialogue:\n{history}\n\n"
+            f"Recent dialogue:\n{raw_history}\n\n"
             f"NEW user input:\n\"{user_input}\"\n\n"
             "Return only the Signifier?"
         )
