@@ -12,7 +12,7 @@ USER root
 # Ensure Protobuf version is compatible with TensorFlow 2.11.1
 RUN pip install "protobuf==3.19.6"
 
-# Install project-specific dependencies
+# Install project-specific dependencies (including nltk)
 RUN if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
 # Download the spaCy language model
