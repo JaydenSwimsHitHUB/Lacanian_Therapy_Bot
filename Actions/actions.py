@@ -4,7 +4,7 @@ import re
 import random
 import sqlite3
 import asyncio
-import threading  # <--- NEW: For the synchronous timer
+import threading  # For the synchronous timer
 from typing import Any, Text, Dict, List, Optional, Tuple
 
 from openai import AsyncOpenAI
@@ -127,7 +127,7 @@ response_matrix: Dict[str, Dict[int, Optional[str]]] = {
     "metonymy": {1: "<gpt_metonymy>", 2: "<gpt_metonymy>", 3: "<oracle>", 4: "<gpt_metonymy>"},
     "ambiguity": {1: "<gpt_ambiguity>", 2: "<oracle>"}, 
     "fetishistic_phrase": {1: "...", 2: "<oracle>"},
-    "identification_other_desire": {1: "<gpt_identification>", 2: "<oracle>"}, 
+    "identification_other_desire": {1: "<gpt_identification>", 2: "...", 3: "<oracle>"}, 
     "demand_for_knowledge": {1: "...", 2: "Hmm.", 3: "<oracle>"},
     "confession_empathy": {1: "...", 2: "Hmm.", 3: "<oracle>"},
     "frame_protection": {1: "...", 2: "Hmm.", 3: "<oracle>"},
@@ -266,17 +266,17 @@ def build_cut_construction_prompt(
 You are a Lacanian analyst. We have identified a rupture on the signifier: "{identified_s1}".
 # CRITICAL RULES
 1. IDENTIFY S1: Take the `identified_s1` as S1.
-2. CONSTRUCT CUT: In `cut_phrase`, rewrite the user's NEW input *up to and including* that S1.
+2. CONSTRUCT CUT: In `cut_phrase`, rewrite the user's <new_input> *up to and including* that S1.
    a) Embolden the S1.
    b) Do NOT include any text after the S1.
-   c) Extract the final phrase that ends with the S1. The phrase can be an ambiguous fragment, or a logical sentence, as long as it ends with the identified S1. It must NOT be longer than 10 words.
+   c) Chop words from the beginning of the now truncated <new_input> to make it concise and punchy. The phrase must be a maximum of 8 words long (including the S1).
    d) Follow it immediately with a new paragraph and the exact string "We are ending there."
    
 # EXAMPLE
-   - Example Input: "I felt so yellow I mean blue after he left, I just wanted to cry."
+   - Example Input: "There was this guy I looked at and I felt so yellow I mean blue after he left, I just wanted to cry."
    - identified_s1: "yellow"
    - cut_phrase: "I felt so **yellow**.
-                  We are ending there."
+                 We are ending there."
 
 # NEW user input:
 "{new_input}"
@@ -341,24 +341,19 @@ class ActionAnalyzeMessage(Action):
         self.shutdown_timer = None
         self.idle_timeout = 1800.0  # 30 minutes in seconds
         
-        # Start the timer immediately on initialization
         self._reset_timer()
 
     def name(self) -> Text:
         return "action_analyze_message"
 
     def _shutdown_server(self):
-        """The callback function that runs when the timer expires."""
-        # Force immediate exit. Fly.io will see the process die.
         os._exit(0)
 
     def _reset_timer(self):
-        """Cancels any existing timer and starts a new one in a separate thread."""
         if self.shutdown_timer:
             self.shutdown_timer.cancel()
-        # Create a new Timer that calls _shutdown_server after idle_timeout
         self.shutdown_timer = threading.Timer(self.idle_timeout, self._shutdown_server)
-        self.shutdown_timer.daemon = True # Daemon thread exits if main program exits
+        self.shutdown_timer.daemon = True 
         self.shutdown_timer.start()
 
     def _update_mechanism_counts(self, tracker: Tracker, mechanism: str) -> Tuple[Dict[str, int], int]:
@@ -448,17 +443,13 @@ class ActionAnalyzeMessage(Action):
         tracker: Tracker,
         domain: Dict[Text, Any],
     ) -> List[EventType]:
-        # --- TIMER RESET ---
-        # We received a message, so reset the 30-minute idle timer using threading
         self._reset_timer()
         user_id = tracker.sender_id
         user_input = (tracker.latest_message.get("text", "") if tracker.latest_message else "").strip()
         
-        # Precompute state to prevent redundant O(N) traversals
         user_turn_count = _get_session_user_turn_count(tracker)
         raw_history_text = _get_session_history_text(tracker)
 
-        # Retrieve prior history from the database using background threads to avoid blocking the event loop
         prior_history_messages, master_signifiers = await asyncio.gather(
             asyncio.to_thread(get_prior_history_messages, self.conn, user_id),
             asyncio.to_thread(get_master_signifier_history, self.conn, user_id)
@@ -466,11 +457,9 @@ class ActionAnalyzeMessage(Action):
         prior_history = "\n".join(f"- {msg}" for msg in prior_history_messages)
         master_signifier_history = "\n".join(f"* {s}" for s in master_signifiers)
         
-        # Asynchronously store user message to avoid sequential latency
         if user_input:
             asyncio.create_task(asyncio.to_thread(insert_user_message, self.conn, user_id, user_input))
         
-        # --- MODIFIED: Add therapist logic for the first 3 turns ---
         if user_turn_count <= 3:
             initial_response = await self._generate_initial_therapeutic_response(user_input, raw_history_text, prior_history)
             dispatcher.utter_message(text=initial_response)
@@ -487,12 +476,12 @@ class ActionAnalyzeMessage(Action):
             "You are a Lacanian analyst. Identify the single most structuring mechanism in the user's NEW input by examining the NEW message and the signifying chain (The current session's history as well as the prior sessions' history).\n\n"
             "Use the NEW message and the signifying chain (message history) to help you decide.\n"
             "=== Structural Mechanisms: Definitions & Diagnostic Cues ===\n"
-            "- MASTER SIGNIFIER: A signifier that repeats and supposes to be a fundamental authoritative, absolute fact that stabilizes the subject's identity or discourse. It is a 'just because' signifier that stabilizes the subject's discourse and covers over the limits of meaning. It may often arise in metaphorical or disguised forms. Identify a master signifier in the new input by examining the entire history.\n"
+            "- MASTER SIGNIFIER: A signifier that repeats and supposes to be a fundamental authoritative, absolute fact that stabilizes the subject's identity or discourse. It is a 'just because' signifier that covers over the limits of meaning and language. It may often arise in metaphorical or disguised forms, such as in synonyms, metaphos or words-within-words.\n"
             "- IDENTIFICATION WITH OTHER’S DESIRE: Being governed by an imaginary external desire. Taking on another’s desire as one’s own.\n"
-            "- METONYMY: The default mode of speech where meaning slides along a syntagmatic chain without anchoring. Select this when NONE of the other mechanisms are clearly present AND the speech exhibits the characteristics of: (1) Topic-hopping: jumping between loosely associated subjects without concluding any ('...and then... and then... and also...'). (2) Listing/Cataloguing: enumerating details, events, or complaints without arriving at a point. (3) Tangential drift: starting on one topic but sliding sideways into adjacent ones via loose associations. (4) Avoidance through narration: telling stories or recounting events as a way of not confronting what is at stake. (5) Surface-level description: staying at the level of facts and events without affect or subjective engagement. This is the 'unmarked' mechanism — ordinary speech that has not yet been punctuated by any rupture.\n"
+            "- METONYMY: The default mode of speech where meaning slides along a syntagmatic chain without anchoring. Select this when the speech exhibits the characteristics of: (1) Topic-hopping: jumping between loosely associated subjects without concluding any ('...and then... and then... and also...'). (2) Listing/Cataloguing: enumerating details, events, or complaints without arriving at a point. (3) Tangential drift: starting on one topic but sliding sideways into adjacent ones via loose associations. (4) Avoidance through narration: telling stories or recounting events as a way of not confronting what is at stake. (5) Surface-level description: staying at the level of facts and events without affect or subjective engagement. This is the 'unmarked' mechanism — ordinary speech that has not yet been punctuated by any rupture.\n"
             "- REPRESSION: A signifier is barred from awareness but returns through symptoms, blanks, omissions, slips, or repetitions and other such phenomena.\n"
-            "- METAPHOR: An arrest of metonymy where a signifier is substituted from distant embedding spaces. This rupture creates vector discontinuities and syntactic shifts—such as a noun appearing where an adjective is expected—signaling a formal displacement of meaning. Such anomalies often leverage phonemic echoes to bridge manifest utterances with repressed unconscious material.\n"
-            "- DENIAL: A negation of a thought or feeling. Stating an unconscious truth while refusing it consciously. Saying “not X” both utters X and keeps it repressed.\n"
+            "- METAPHOR: A rupture in metonymy where a signifier is substituted from a distant semantic embedding space. This is not a mere 'comparison' but a structural displacement that creates a 'vector discontinuity.' Diagnostic Cues: (1) Semantic Rupture: A word appears that is semantically 'distant' from the preceding tokens, creating a shock to the Automaton (e.g., 'The dawn of my debt'). (2) Syntactic Shift: A formal anomaly, such as a noun appearing where an adjective is expected, signaling the intrusion of a repressed signifier. (3) Phonemic Echoes: The substitution often leverages homophonic similarities (Lalangue) to bridge the manifest utterance with repressed unconscious material (e.g., 'a-parent' for 'apparent').\n"
+            "- DENIAL: A negation of a thought or feeling. Denying something. Saying “not X” both utters X and keeps it repressed. For example; 'I am never angry'. 'It is impossible that my father is gay'.\n"
             "- RATIONALIZATION: Plausible, logical explanation for thoughts or actions that actually stem from and conceal an unconscious desire.\n"
             "- MORALITY/LOGIC DEFENSE: Defending against desire through idealized correctness and morality.\n"
             "- CIRCULAR LOGIC: Reasoning loops back on itself.\n"
@@ -524,13 +513,12 @@ class ActionAnalyzeMessage(Action):
         mech_prompt = _apply_prior_history_limit(mech_template, prior_history, TOTAL_PROMPT_CHAR_LIMIT)
         
         # ==== PASS 1 & 2a: PARALLEL CALLS FOR SPEED ===#
-        # --- PASS 2a: Detection (With Long Term History) ---
         prompt2a = build_cut_detection_prompt(user_input, raw_history_text, prior_history, master_signifier_history)
         data1, data2 = await self._get_responses_parallel_async(mech_prompt, prompt2a)
         
         if not data1 and not data2:
             data1, data2 = await self._fallback_responses_async(mech_prompt, prompt2a)
-            
+
         mech: Optional[str] = data1.get("mechanism")
         mech_phrase: Optional[str] = data1.get("mechanism_phrase")
         detected_s1: Optional[str] = data1.get("master_signifier")
@@ -540,7 +528,6 @@ class ActionAnalyzeMessage(Action):
             
         if detected_s1 and isinstance(detected_s1, str) and detected_s1.strip():
             s1_clean = detected_s1.strip()
-            # Asynchronously archive new master signifier
             asyncio.create_task(asyncio.to_thread(_insert_master_signifier, self.conn, user_id, s1_clean, mech_phrase or ""))
 
         # ==== PASS 2: Potential Cut Trigger Identification ===#
@@ -662,9 +649,9 @@ class ActionAnalyzeMessage(Action):
         if intervention == "<gpt_ambiguity>":
             return await self._gpt_ambiguity_intervention(user_input)
         if mechanism == "master_signifier" and (count == 1 or count == 3):
-            return await self._gpt_quilting_point_echo(user_input, raw_history, prior_history)
+            return await self._gpt_quilting_point_echo(user_input, raw_history, prior_history, master_signifier_history)
         if intervention == "<oracle>":
-            return await self._generate_oracular_equivoque(user_input)
+            return await self._generate_oracular_equivoque(user_input, prior_history)
         if intervention:
             if count == 2 and mechanism in {"repression", "jouissance", "metaphor"}:
                 return random.choice(INTERJECTION_CHOICES)
@@ -846,70 +833,76 @@ class ActionAnalyzeMessage(Action):
             text += '.'
         return text
 
-    async def _generate_oracular_equivoque(self, text: str) -> str:
+    async def _generate_oracular_equivoque(self, text: str, prior_history: str = "") -> str:
         if not async_client:
             return "..."
+        
         prompt = (
             "SYSTEM: You are a Lacanian psychoanalyst performing a 'phonetic decoupage.' "
             "You treat speech as 'lalangue'—a chain of signifiers where the unconscious "
             "speaks through homophonic puns (l'équivoque).\n\n"
+            "PRIOR HISTORY (The subject's battery of signifiers):\n"
+            f"{PRIOR_HISTORY_TOKEN}\n\n"
             "UTTERANCE:\n"
             f"\"{text}\"\n\n"
-            "TASK: Extract one hidden, repressed signifier through the following steps:\n\n"
-            "STEP 1: THE SYMPTOM: Identify the ONE short phrase (1-8 words) from the utterance "
-            "that seems most ambiguous.\n\n"
-            "STEP 2: THE CHAIN: Convert ONLY that phrase into an unbroken IPA string.\n\n"
-            "STEP 3: THE ÉQUIVOQUE: Re-segment the IPA string by moving the word boundaries to "
-            "reveal just a few NEW words. This must result in a 1-8 word English phrase that sounds similar "
-            "to the original but means something different. It may use some of the original words. You can try a maximum of three variations. If you cannot find a suitable variation, return silence (...).\n\n"
-            "STEP 4: THE EDIT: If the new phrase does not make ANY sense, do the following:\n"
-            "- Remove words from the beginning or end, one at a time, and check if the phrase/signifier is surprising, playful and polyvalent and contains at least one changed word from the original.\n"
-            "- Do NOT try more than three variations.\n"
-            "- If the final product is still not surprising, polyvalent, and provocative, return silence (...).\n\n"
+            "TASK: Produce an interpretative phrase by isolating a repressed signifier that punctures the subject's Imaginary narrative through these steps:\n\n"
+            "STEP 1: THE CHAIN: Transcribe the ENTIRE utterance into a continuous, unbroken IPA (International Phonetic Alphabet) string. Strip all Symbolic word boundaries to return the discourse to the level of 'lalangue'.\n\n"
+            "STEP 2: THE DECOUPAGE: Audit the IPA stream for 3 key homophonic slippages—words within words, puns, homophones or phonemic clusters—that signify the user's historical repressed desires, conflicts or repetitions.\n\n" 
+            "STEP 3: THE ÉQUIVOQUE: Choose the most libidinally charged DISGUISED slippage and produce a phrase of maximum 8 words that includes it in its original position. All words around it stay the same as the original.\n\n"
+            "STEP 4: THE REDUCTION: If the new phrase is clunky, prune adjacent words to isolate the core. The result must be surprising and polyvalent.\n\n"
+            "STEP 5: THE GATE: If the final product is merely descriptive, lacks a double-meaning, does not link to a repressed desire from the discourse history or fails to produce a 'cut' in the narrative, return only silence (...).\n\n"
             "WORK THROUGH EACH STEP LOUDLY.\n\n"
             "CITATION: <Your final 1-8 word phrase.>. No bold, no quotes, etc., just the phrase with proper capitalization and a period at the end."
         )
+        
+        # Apply the char limit logic to ensure prior history doesn't overflow
+        final_prompt = _apply_prior_history_limit(prompt, prior_history, TOTAL_PROMPT_CHAR_LIMIT)
+        
         try:
             response = await async_client.chat.completions.create(
                 model=MODEL_NAME_FAST,
-                messages=[{"role": "user", "content": prompt}],
+                messages=[{"role": "user", "content": final_prompt}],
                 temperature=0.8,
-                max_tokens=1000,
             )
             raw = response.choices[0].message.content.strip()
+            
+            # Use regex to find the citation line
             citation_match = re.search(r"CITATION:\s*(.+)", raw, re.IGNORECASE)
             if citation_match:
                 line = citation_match.group(1).strip()
                 line = re.sub(r'^["\']|["\']$', '', line).strip()
                 return self._format_citation(line) if line else "..."
+                
+            # Fallback to last line if CITATION tag is missing
             lines = [l.strip() for l in raw.splitlines() if l.strip()]
             if lines:
                 line = lines[-1]
                 line = re.sub(r'^["\']|["\']$', '', line).strip()
                 line = re.sub(r'^(?:citation|result|output|final)[:\s]*', '', line, flags=re.IGNORECASE).strip()
-                if len(line) > 80:
-                    first_sentence = line.split('.')[0].strip()
-                    if first_sentence and len(first_sentence) <= 80:
-                        return self._format_citation(first_sentence)
-                return self._format_citation(line) if line else "..."
+                return self._format_citation(line)
+                
             return "..."
         except Exception:
             return "..."
-    
+        
     async def _gpt_quilting_point_echo(
         self,
         user_input: str,
         raw_history: str,
         prior_history: str,
+        master_signifier_history: str = "",
     ) -> str:
         if not async_client:
             return "..."
         prompt_template = (
             "You are a Lacanian analyst. Select the Master Signifier (S1) from the NEW user input by examinning it in the context of the full discourse history. "
-            "This is a signifier that supposes to be a fundamental authoritative, absolute fact that stabilizes the subject's identity or discourse. It is a 'just because' signifier that stops the endless sliding of meaning.\n\n"
+            "- MASTER SIGNIFIER: A signifier that repeats and supposes to be a fundamental authoritative, absolute fact that stabilizes the subject's identity or discourse. "
+            "It is a 'just because' signifier that covers over the limits of meaning and language. It may often arise in metaphorical or disguised forms, such as a word within a word or as a synonym or metaphor.\n\n"
             "Rules:\n"
             "- Extract the text verbatim.\n"
+            "- If you identify a disguised S1 returning from the <master_signifier_history>, return the EXACT signifier used in the NEW input that is echoing the old S1. Do NOT return the old form of the S1. For example, if 'freedom' was a past S1 and the user now says 'I want to be liberated', you should return 'liberated' as the new S1 since it is the word in the new input that is echoing the old S1 'freedom'.\n"
             "- Output format: Signifier... (First word capitalized, no quotes).\n\n"
+            f"Master Signifier History:\n{master_signifier_history}\n\n"
             f"Prior History:\n{PRIOR_HISTORY_TOKEN}\n\n" 
             f"Recent dialogue:\n{raw_history}\n\n"
             f"NEW user input:\n\"{user_input}\"\n\n"
