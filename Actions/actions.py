@@ -47,18 +47,30 @@ def insert_user_message(conn: sqlite3.Connection, user_id: str, message: str) ->
     )
     conn.commit()
 
-def get_prior_history_messages(conn: sqlite3.Connection, user_id: str) -> List[str]:
-    cursor = conn.execute(
-        "SELECT message FROM user_messages WHERE user_id = ? ORDER BY timestamp ASC, id ASC",
-        (user_id,)
-    )
+def get_prior_history_messages(conn: sqlite3.Connection, user_id: str, limit: int = 800) -> List[str]:
+    query = """
+        SELECT message FROM (
+            SELECT id, message, timestamp 
+            FROM user_messages 
+            WHERE user_id = ? 
+            ORDER BY timestamp DESC, id DESC 
+            LIMIT ?
+        ) ORDER BY timestamp ASC, id ASC
+    """
+    cursor = conn.execute(query, (user_id, limit))
     return [row[0] for row in cursor.fetchall()]
 
-def get_master_signifier_history(conn: sqlite3.Connection, user_id: str) -> List[str]:
-    cursor = conn.execute(
-        "SELECT signifier FROM master_signifiers WHERE user_id = ? ORDER BY timestamp ASC, id ASC",
-        (user_id,)
-    )
+def get_master_signifier_history(conn: sqlite3.Connection, user_id: str, limit: int = 100) -> List[str]:
+    query = """
+        SELECT signifier FROM (
+            SELECT id, signifier, timestamp 
+            FROM master_signifiers 
+            WHERE user_id = ? 
+            ORDER BY timestamp DESC, id DESC 
+            LIMIT ?
+        ) ORDER BY timestamp ASC, id ASC
+    """
+    cursor = conn.execute(query, (user_id, limit))
     return [row[0] for row in cursor.fetchall()]
 
 def _insert_master_signifier(conn: sqlite3.Connection, user_id: str, signifier: str, phrase: str) -> None:
@@ -72,7 +84,6 @@ def _insert_master_signifier(conn: sqlite3.Connection, user_id: str, signifier: 
             (user_id, signifier, phrase)
         )
         conn.commit()
-
 
 # --- UTILITY: ROBUST JSON EXTRACTION ---
 def _extract_json(content: str) -> Dict[str, Any]:
@@ -139,7 +150,6 @@ CUT_TRIGGERS = [
     "major_shift_retroactive",
 ]
 
-
 # ---------- Utility for prompts ----------
 
 def _get_session_history_text(tracker: Tracker) -> str:
@@ -173,7 +183,6 @@ def _get_session_history_text(tracker: Tracker) -> str:
     
     return "\n".join(lines) if lines else "(no prior conversation in this session)"
 
-
 def _truncate_text_keep_end(text: str, max_chars: int) -> str:
     if not text:
         return text
@@ -185,7 +194,6 @@ def _truncate_text_keep_end(text: str, max_chars: int) -> str:
         return text[-max_chars:]
     keep_chars = max_chars - len(TRUNCATION_MARKER)
     return TRUNCATION_MARKER + text[-keep_chars:]
-
 
 def _apply_prior_history_limit(template: str, prior_history: str, total_limit: int) -> str:
     if PRIOR_HISTORY_TOKEN not in template:
@@ -200,7 +208,6 @@ def _apply_prior_history_limit(template: str, prior_history: str, total_limit: i
     truncated = _truncate_text_keep_end(prior_history or "", remaining)
     return before + truncated + after
 
-
 def _get_session_user_turn_count(tracker: Tracker) -> int:
     count = 0
     for event in reversed(tracker.events): 
@@ -209,7 +216,6 @@ def _get_session_user_turn_count(tracker: Tracker) -> int:
         if event.get("event") == "user" and event.get("text"):
             count += 1
     return count
-
 
 def build_cut_detection_prompt(
     new_input: str,
@@ -256,7 +262,6 @@ Respond ONLY in JSON:
 cut_trigger: null or one of {cuts}.
 """
     return _apply_prior_history_limit(template, prior_history_str, TOTAL_PROMPT_CHAR_LIMIT)
-
 
 def build_cut_construction_prompt(
     new_input: str,
@@ -307,7 +312,6 @@ class ActionSessionStartCustom(Action):
             SlotSet("cut_trigger", None),
             ActionExecuted("action_listen"),
         ]
-
 
 class ActionAnalyzeMessage(Action):
     def __init__(self):
@@ -451,8 +455,8 @@ class ActionAnalyzeMessage(Action):
         raw_history_text = _get_session_history_text(tracker)
 
         prior_history_messages, master_signifiers = await asyncio.gather(
-            asyncio.to_thread(get_prior_history_messages, self.conn, user_id),
-            asyncio.to_thread(get_master_signifier_history, self.conn, user_id)
+            asyncio.to_thread(get_prior_history_messages, self.conn, user_id, 800),
+            asyncio.to_thread(get_master_signifier_history, self.conn, user_id, 100)
         )
         prior_history = "\n".join(f"- {msg}" for msg in prior_history_messages)
         master_signifier_history = "\n".join(f"* {s}" for s in master_signifiers)
@@ -589,21 +593,21 @@ class ActionAnalyzeMessage(Action):
 
     async def _generate_initial_therapeutic_response(self, user_input: str, raw_history: str, prior_history: str) -> str:
         prompt_template = (
-            "You are an insightful and empathetic therapist. Your goal for these initial sessions is to build rapport and hope by offering interpretations and mirroring that feel deeply personal to the user, even though they are based on universal psychological principles. This is a technique to make the user feel seen and understood, encouraging them to open up.\n\n"
+            "You are an insightful and empathetic therapist. Your goal for these initial sessions is to build rapport by offering interpretations and mirroring that feel deeply personal to the user, even though they are based on universal psychological principles. This is a technique to make the user feel seen and understood, encouraging them to open up.\n\n"
             "GUIDELINES:\n"
-            "1.  **Use Universal Themes:** Your interpretations should touch on common human conflicts and desires. Do NOT point out that these desires and conflicts are universally human. Keep it personal. \n"
+            "1.  **Use Universal Themes:** Your interpretations should touch on common human conflicts and desires. Keep your personal. \n"
             "2.  **Employ 'Barnum Statements':** Craft statements that are general enough to apply to most people but sound like specific, personal insights.\n"
             "3.  **Validate and Reframe:** Acknowledge the user's feelings and gently reframe their situation.\n"
-            "4.  **Maintain a Professional, Warm Tone:** The tone should be that of a skilled therapist—calm, reassuring, and thoughtful. Avoid clichés and overly sentimental language.\n"
-            "5.  **Keep Evolving to Sound Human:** Use the session history to see what you said before, how you said it, and how the user reacted. Then respond with the history in mind to deepen the therapeutic connection. Ensure you do not sound robotic and predictible.\n"
-            "6.  **Keep it Brief and Open-Ended:** Respond as briefly as possible. Between 1-2 sentences. The response should invite further reflection from the user without asking a direct question.\n"
+            "4.  **Maintain a Professional, Warm Tone:** The tone should be that of a skilled Rogerian therapist—calm, and reflective.\n"
+            "5.  **Keep Evolving to Sound Human:** Use the session history to see what you said before, how you said it, and how the user reacted. Then respond with the history in mind to deepen the therapeutic connection. Ensure you start each message differently so that you speak naturally.\n"
+            "6.  **Structural Constraint:** Formulate exactly ONE short, complete sentence (maximum 20 words). It must end decisively with a period or question mark.\n"
             "PRIOR SESSION HISTORY (Long Term):\n" 
             f"{PRIOR_HISTORY_TOKEN}\n\n"
             "SESSION HISTORY:\n"
             f"{raw_history}\n\n"
             "USER'S LATEST MESSAGE:\n"
             f'"{user_input}"\n\n'
-            "Craft your insightful, universally applicable therapeutic interpretation based on the entire conversation."
+            "Craft your singular, insightful therapeutic interpretation based on the entire conversation."
         )
         prompt = _apply_prior_history_limit(prompt_template, prior_history, TOTAL_PROMPT_CHAR_LIMIT)
         try:
@@ -620,12 +624,22 @@ class ActionAnalyzeMessage(Action):
                 model=MODEL_NAME_FAST,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.8,
+                max_tokens=100  # Expanded buffer to prevent hard truncation
             )
             response_text = resp.choices[0].message.content.strip().replace('\n', ' ')
+            
+            # Post-processing: Isolate the first complete sentence structure.
+            if not re.search(r'[.!?]$', response_text):
+                match = re.search(r'^(.*?[.!?])', response_text)
+                if match:
+                    response_text = match.group(1).strip()
+                else:
+                    response_text += "..."
+                    
             return response_text
         except Exception as e:
             raise e
-
+        
     async def handle_mechanism(
         self,
         mechanism: str,
@@ -651,7 +665,12 @@ class ActionAnalyzeMessage(Action):
         if mechanism == "master_signifier" and (count == 1 or count == 3):
             return await self._gpt_quilting_point_echo(user_input, raw_history, prior_history, master_signifier_history)
         if intervention == "<oracle>":
-            return await self._generate_oracular_equivoque(user_input, prior_history)
+            return await self._generate_oracular_equivoque(
+                text=user_input, 
+                mechanism=mechanism, 
+                raw_history=raw_history, 
+                prior_history=prior_history
+            )
         if intervention:
             if count == 2 and mechanism in {"repression", "jouissance", "metaphor"}:
                 return random.choice(INTERJECTION_CHOICES)
@@ -695,7 +714,7 @@ class ActionAnalyzeMessage(Action):
                 max_tokens=15,
             )
             line = resp.choices[0].message.content.strip()
-            line = re.sub(r'^[\"\'\“\”]+|[\"\'\“\”]+$', "", line).strip()
+            line = line.strip("\"'").strip()
             if line:
                 line = line[0].upper() + line[1:]
             return line
@@ -729,7 +748,7 @@ class ActionAnalyzeMessage(Action):
                 temperature=0.2,
             )
             line = resp.choices[0].message.content.strip()
-            line = re.sub(r'^[\"\'\“\”]+|[\"\'\“\”]+$', "", line).strip()
+            line = line.strip("\"'").strip()
             if not line.endswith("?"):
                 line += "?"
             return line
@@ -760,7 +779,7 @@ class ActionAnalyzeMessage(Action):
                 temperature=0.2,
             )
             line = resp.choices[0].message.content.strip()
-            line = re.sub(r'^[\"\'\“\”]+|[\"\'\“\”]+$', "", line).strip()
+            line = line.strip("\"'").strip()
             if not line.endswith("?"):
                 line += "?"
             return line
@@ -812,7 +831,7 @@ class ActionAnalyzeMessage(Action):
                 temperature=0.4,
             )
             line = resp.choices[0].message.content.strip()
-            line = re.sub(r'^[\"\'\“\”]+|[\"\'\“\”]+$', "", line).strip()
+            line = line.strip("\"'").strip()
             line = line.splitlines()[0].strip()
             if not line:
                 return "..."
@@ -833,55 +852,47 @@ class ActionAnalyzeMessage(Action):
             text += '.'
         return text
 
-    async def _generate_oracular_equivoque(self, text: str, prior_history: str = "") -> str:
+    async def _generate_oracular_equivoque(self, text: str, mechanism: str, raw_history: str, prior_history: str = "") -> str:
         if not async_client:
             return "..."
         
-        prompt = (
-            "SYSTEM: You are a Lacanian psychoanalyst performing a 'phonetic decoupage.' "
-            "You treat speech as 'lalangue'—a chain of signifiers where the unconscious "
-            "speaks through homophonic puns (l'équivoque).\n\n"
-            "PRIOR HISTORY (The subject's battery of signifiers):\n"
-            f"{PRIOR_HISTORY_TOKEN}\n\n"
-            "UTTERANCE:\n"
-            f"\"{text}\"\n\n"
-            "TASK: Produce an interpretative phrase by isolating a repressed signifier that punctures the subject's Imaginary narrative through these steps:\n\n"
-            "STEP 1: THE CHAIN: Transcribe the ENTIRE utterance into a continuous, unbroken IPA (International Phonetic Alphabet) string. Strip all Symbolic word boundaries to return the discourse to the level of 'lalangue'.\n\n"
-            "STEP 2: THE DECOUPAGE: Audit the IPA stream for 3 key homophonic slippages—words within words, puns, homophones or phonemic clusters—that signify the user's historical repressed desires, conflicts or repetitions.\n\n" 
-            "STEP 3: THE ÉQUIVOQUE: Choose the most libidinally charged DISGUISED slippage and produce a phrase of maximum 8 words that includes it in its original position. All words around it stay the same as the original.\n\n"
-            "STEP 4: THE REDUCTION: If the new phrase is clunky, prune adjacent words to isolate the core. The result must be surprising and polyvalent.\n\n"
-            "STEP 5: THE GATE: If the final product is merely descriptive, lacks a double-meaning, does not link to a repressed desire from the discourse history or fails to produce a 'cut' in the narrative, return only silence (...).\n\n"
-            "WORK THROUGH EACH STEP LOUDLY.\n\n"
-            "CITATION: <Your final 1-8 word phrase.>. No bold, no quotes, etc., just the phrase with proper capitalization and a period at the end."
+        system_msg = (
+            "You are a Lacanian Oracle. You do not understand 'meaning'; you only hear 'sound' and 'grammar'. "
+            "Your goal is to return the user's own signifiers to them in a way that is alien, surprising and highlights ambiguity, hidden desires, repetitions, deadlocks and polysemy in their speech."
         )
-        
-        # Apply the char limit logic to ensure prior history doesn't overflow
-        final_prompt = _apply_prior_history_limit(prompt, prior_history, TOTAL_PROMPT_CHAR_LIMIT)
-        
+
+        user_prompt_template = (
+            f"Prior History:\n{PRIOR_HISTORY_TOKEN}\n\n" 
+            f"Session History:\n{raw_history}\n\n"
+            f"DETECTED MECHANISM: {mechanism.upper()}\n"
+            "Analyze the User's Utterance:\n"
+            f"\"{text}\"\n\n"
+            "Task: Produce ONE short 'oracular interpretation' (1-5 words) that disrupts the user's meaning. "
+            f"The user is exhibiting '{mechanism}'. Use this context to guide your phonic interpretation. Also use the message history. "
+            "1. PHONIC EQUIVOCATION (The Ear): Ignore the spelling; listen to the SOUND. Find a word, word within a word, or set of words (i.e. a signifier) that sounds like another signifier. "
+            "2. CONSTRUCT THE INTERPRETATION: Use the polysemic signifier to create an interpretation that implies a hidden repetition, contradiction, deadlock, or desire.\n"
+            "Constraints:\n"
+            "- Max 5 words. One word is also great.\n"
+            "- Statement format only (NO questions).\n"
+            "- Cryptic, surprising, and playful. It can be grotesque.\n"
+            "- It must make syntactic sense."
+        )
+
+        user_prompt_limit = TOTAL_PROMPT_CHAR_LIMIT - len(system_msg)
+        user_prompt = _apply_prior_history_limit(user_prompt_template, prior_history, user_prompt_limit)
+
         try:
             response = await async_client.chat.completions.create(
-                model=MODEL_NAME_FAST,
-                messages=[{"role": "user", "content": final_prompt}],
-                temperature=0.8,
+                model=MODEL_NAME_FAST,  
+                messages=[
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.8, 
+                max_tokens=10,
             )
-            raw = response.choices[0].message.content.strip()
-            
-            # Use regex to find the citation line
-            citation_match = re.search(r"CITATION:\s*(.+)", raw, re.IGNORECASE)
-            if citation_match:
-                line = citation_match.group(1).strip()
-                line = re.sub(r'^["\']|["\']$', '', line).strip()
-                return self._format_citation(line) if line else "..."
-                
-            # Fallback to last line if CITATION tag is missing
-            lines = [l.strip() for l in raw.splitlines() if l.strip()]
-            if lines:
-                line = lines[-1]
-                line = re.sub(r'^["\']|["\']$', '', line).strip()
-                line = re.sub(r'^(?:citation|result|output|final)[:\s]*', '', line, flags=re.IGNORECASE).strip()
-                return self._format_citation(line)
-                
-            return "..."
+            line = response.choices[0].message.content.strip()
+            return line.strip("\"'").strip()
         except Exception:
             return "..."
         
@@ -896,11 +907,11 @@ class ActionAnalyzeMessage(Action):
             return "..."
         prompt_template = (
             "You are a Lacanian analyst. Select the Master Signifier (S1) from the NEW user input by examinning it in the context of the full discourse history. "
-            "- MASTER SIGNIFIER: A signifier that repeats and supposes to be a fundamental authoritative, absolute fact that stabilizes the subject's identity or discourse. "
+            "It is a signifier that repeats and supposes to be a fundamental authoritative, absolute fact that stabilizes the subject's identity or discourse. "
             "It is a 'just because' signifier that covers over the limits of meaning and language. It may often arise in metaphorical or disguised forms, such as a word within a word or as a synonym or metaphor.\n\n"
             "Rules:\n"
             "- Extract the text verbatim.\n"
-            "- If you identify a disguised S1 returning from the <master_signifier_history>, return the EXACT signifier used in the NEW input that is echoing the old S1. Do NOT return the old form of the S1. For example, if 'freedom' was a past S1 and the user now says 'I want to be liberated', you should return 'liberated' as the new S1 since it is the word in the new input that is echoing the old S1 'freedom'.\n"
+            "- If you identify a disguised S1 returning from the <master_signifier_history>, return the EXACT signifier used in the <NEW_user_input> that is echoing the old S1.\n"
             "- Output format: Signifier... (First word capitalized, no quotes).\n\n"
             f"Master Signifier History:\n{master_signifier_history}\n\n"
             f"Prior History:\n{PRIOR_HISTORY_TOKEN}\n\n" 
@@ -914,7 +925,7 @@ class ActionAnalyzeMessage(Action):
                 model=MODEL_NAME_FAST,
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=15,
-                temperature=0.3,
+                temperature=0.1,
             )
             line = resp.choices[0].message.content.strip()
             line = re.sub(r"[^a-zA-Z0-9 ]", "", line).strip()
