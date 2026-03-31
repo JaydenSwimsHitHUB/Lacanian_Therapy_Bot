@@ -134,7 +134,7 @@ response_matrix: Dict[str, Dict[int, Optional[str]]] = {
     "morality_logic_defense": {1: "...", 2: "And yet...", 3: "<oracle>"},
     "circular_logic": {1: "...", 2: "Hmm.", 3: "<oracle>"},
     "master_signifier": {1: "<S1_echo>", 2: "<oracle>"},
-    "metaphor": {1: "...", 2: "Mhmm?", 3: "<oracle>"},
+    "quilting_point": {1: "Mhmm?", 2: "<oracle>"},
     "metonymy": {1: "<gpt_metonymy>", 2: "<gpt_metonymy>", 3: "<oracle>", 4: "<gpt_metonymy>"},
     "ambiguity": {1: "<gpt_ambiguity>", 2: "<oracle>"}, 
     "fetishistic_phrase": {1: "...", 2: "<oracle>"},
@@ -273,7 +273,7 @@ You are a Lacanian analyst. We have identified a rupture on the signifier: "{ide
 1. IDENTIFY S1: Take the `identified_s1` as S1.
 2. CONSTRUCT CUT: In `cut_phrase`, rewrite the user's <new_input> *up to and including* that S1.
    a) Embolden the S1.
-   b) Do NOT include any text after the S1.
+   b) Terminate the string immediately following the S1.
    c) Chop words from the beginning of the now truncated <new_input> to make it concise and punchy. The phrase must be a maximum of 8 words long (including the S1).
    d) Follow it immediately with a new paragraph and the exact string "We are ending there."
    
@@ -419,7 +419,7 @@ class ActionAnalyzeMessage(Action):
                 async_client.chat.completions.create(
                     model=MODEL_NAME_FAST,
                     messages=[{"role": "user", "content": scansion_prompt}],
-                    temperature=0.4,
+                    temperature=0.1,
                     max_tokens=600,
                 )
             )
@@ -477,25 +477,22 @@ class ActionAnalyzeMessage(Action):
         # ==== PASS 1: Local mechanism identification ===#
         allowed = list(ALLOWED_MECHANISMS)
         mech_template = (
-            "You are a Lacanian analyst. Identify the single most structuring mechanism in the user's NEW input by examining the NEW message and the signifying chain (The current session's history as well as the prior sessions' history).\n\n"
-            "Use the NEW message and the signifying chain (message history) to help you decide.\n"
-            "=== Structural Mechanisms: Definitions & Diagnostic Cues ===\n"
-            "- MASTER SIGNIFIER: A signifier that repeats and supposes to be a fundamental authoritative, absolute fact that stabilizes the subject's identity or discourse. It is a 'just because' signifier that covers over the limits of meaning and language. It may often arise in metaphorical or disguised forms, such as in synonyms, metaphos or words-within-words.\n"
-            "- IDENTIFICATION WITH OTHER’S DESIRE: Being governed by an imaginary external desire. Taking on another’s desire as one’s own.\n"
-            "- METONYMY: The default mode of speech where meaning slides along a syntagmatic chain without anchoring. Select this when the speech exhibits the characteristics of: (1) Topic-hopping: jumping between loosely associated subjects without concluding any ('...and then... and then... and also...'). (2) Listing/Cataloguing: enumerating details, events, or complaints without arriving at a point. (3) Tangential drift: starting on one topic but sliding sideways into adjacent ones via loose associations. (4) Avoidance through narration: telling stories or recounting events as a way of not confronting what is at stake. (5) Surface-level description: staying at the level of facts and events without affect or subjective engagement. This is the 'unmarked' mechanism — ordinary speech that has not yet been punctuated by any rupture.\n"
-            "- REPRESSION: A signifier is barred from awareness but returns through symptoms, blanks, omissions, slips, or repetitions and other such phenomena.\n"
-            "- METAPHOR: A rupture in metonymy where a signifier is substituted from a distant semantic embedding space. This is not a mere 'comparison' but a structural displacement that creates a 'vector discontinuity.' Diagnostic Cues: (1) Semantic Rupture: A word appears that is semantically 'distant' from the preceding tokens, creating a shock to the Automaton (e.g., 'The dawn of my debt'). (2) Syntactic Shift: A formal anomaly, such as a noun appearing where an adjective is expected, signaling the intrusion of a repressed signifier. (3) Phonemic Echoes: The substitution often leverages homophonic similarities (Lalangue) to bridge the manifest utterance with repressed unconscious material (e.g., 'a-parent' for 'apparent').\n"
-            "- DENIAL: A negation of a thought or feeling. Denying something. Saying “not X” both utters X and keeps it repressed. For example; 'I am never angry'. 'It is impossible that my father is gay'.\n"
-            "- RATIONALIZATION: Plausible, logical explanation for thoughts or actions that actually stem from and conceal an unconscious desire.\n"
-            "- MORALITY/LOGIC DEFENSE: Defending against desire through idealized correctness and morality.\n"
-            "- CIRCULAR LOGIC: Reasoning loops back on itself.\n"
-            "- CONTRADICTION: A later statement cancels or undoes an earlier one without the speaker acknowledging or realizing the conflict.\n"
-            "- JOUISSANCE: The paradox where the subject derives satisfaction from a symptom that is consciously painful or unpleasant. Do not look for 'happiness' but for the Drive (the loop). At least three of the following criteria must be met for you to select this mechanism: (1) Repetition ('I keep doing it', 'again and again'); (2) Paradox ('I hate it but I can't stop', 'awful but I need it'); (3) Excess ('overwhelming', 'too much', 'unbearable'); (4) The Body (physical symptoms, vomiting, shaking) alongside painful, excessive emotion; (5) Fixation on a partial object.\n"
-            "- AMBIGUITY: Indeterminate referents and unfinished ideas.\n"
-            "- FETISHISTIC PHRASES: Clichés that halt the exploration of desire(s). Common phrases that are impersonal and formulaic.\n"
-            "- DEMAND FOR KNOWLEDGE: Demand(s) for knowledge and inquiries leveled at you.\n"
-            "- CONFESSION/EMPATHIC APPEAL: Seeking rescue or closeness.\n"
-            "- FRAME PROTECTION: Demands for the session to end.\n\n"
+            "- master_signifier: A signifier that repeats across history and is supposed to be a fundamental authoritative, absolute fact that stabilizes the subject's identity or discourse. It is a 'just because' signifier that covers over the limits of meaning and language. It may often arise in metaphorical or disguised forms, such as in synonyms, metaphors or words-within-words.\n"
+            "- identification_other_desire: Being governed by an imaginary external desire. Taking on another’s desire as one’s own.\n"
+            "- metonymy: The default mode of speech where meaning slides along a syntagmatic chain without anchoring. Select this when the speech exhibits the characteristics of: (1) Topic-hopping: jumping between loosely associated subjects without concluding any ('...and then... and then... and also...'). (2) Listing/Cataloguing: enumerating details, events, or complaints without arriving at a point. (3) Tangential drift: starting on one topic but sliding sideways into adjacent ones via loose associations. (4) Avoidance through narration: telling stories or recounting events as a way of not confronting what is at stake. (5) Surface-level description: staying at the level of facts and events without affect or subjective engagement. This is the 'unmarked' mechanism — ordinary speech that has not yet been punctuated by any rupture.\n"
+            "- repression: A signifier is barred from awareness but returns through symptoms, blanks, omissions, slips, or repetitions and other such phenomena.\n"
+            "- quilting_point: Metaphors quilt the sliding chain of signifiers, positing social objects as 'Answers' to the lack in the Other. While these metaphors provide temporary stability (Quilting Points), they often function as 'packaged knowledge' that obscures the Real of desire, which is that no object can satisfy it. For exmaple the user saying, 'I feel like if I just get this job I will be satisfied'.\n"
+            "- denial: Negating a thought or feeling. Denying a desire. Saying “not X” both affirms the possible existence of X and keeps it at bay. For example: 'I am never angry'; 'It is impossible that my father is gay'; 'I am not my father's son'.\n"
+            "- rationalization: Plausible, logical explanation for thoughts or actions that actually stem from and conceal an unconscious desire.\n"
+            "- morality_logic_defense: Defending against desire through idealized correctness and morality.\n"
+            "- circular_logic: Reasoning loops back on itself.\n"
+            "- contradiction: A later statement cancels or undoes an earlier one without the speaker acknowledging or realizing the conflict.\n"
+            "- jouissance: The paradox where the subject derives satisfaction from a symptom that is consciously painful or unpleasant. Do not look for 'happiness' but for the Drive (the loop). At least three of the following criteria must be met for you to select this mechanism: (1) Repetition ('I keep doing it', 'again and again'); (2) Paradox ('I hate it but I can't stop', 'awful but I need it'); (3) Excess ('overwhelming', 'too much', 'unbearable'); (4) The Body (physical symptoms, vomiting, shaking) alongside painful, excessive emotion; (5) Fixation on a partial object.\n"
+            "- ambiguity: Indeterminate referents and unfinished ideas.\n"
+            "- fetishistic_phrase: Clichés that halt the exploration of desire(s). Common phrases that are impersonal and formulaic.\n"
+            "- demand_for_knowledge: Demand(s) for knowledge and inquiries leveled at you.\n"
+            "- confession_empathy: Seeking rescue or closeness.\n"
+            "- frame_protection: Demands for the session to end.\n\n"
             "Master Signifier (S1) History (previously identified S1s for this user):\n"
             f"{master_signifier_history}\n\n"
             "Raw recent dialogue:\n"
@@ -512,7 +509,7 @@ class ActionAnalyzeMessage(Action):
             '  "master_signifier": "the S1 signifier" or null\n'
             "}\n\n"
             f"Allowed: {allowed}\n"
-            "No commentary."
+            "Only output exactly one valid JSON object."
         )
         mech_prompt = _apply_prior_history_limit(mech_template, prior_history, TOTAL_PROMPT_CHAR_LIMIT)
         
@@ -568,7 +565,16 @@ class ActionAnalyzeMessage(Action):
             
         if mech in ALLOWED_MECHANISMS:
             counts, cnt = self._update_mechanism_counts(tracker, mech)
-            text = await self.handle_mechanism(mech, cnt, user_input, mech_phrase, raw_history_text, prior_history, master_signifier_history)
+            text = await self.handle_mechanism(
+                mechanism=mech, 
+                count=cnt, 
+                user_input=user_input, 
+                phrase=mech_phrase, 
+                raw_history=raw_history_text, 
+                prior_history=prior_history, 
+                master_signifier_history=master_signifier_history,
+                detected_s1=detected_s1
+            )
             dispatcher.utter_message(text=text)
             return [
                 SlotSet("last_mechanism", mech),
@@ -595,7 +601,7 @@ class ActionAnalyzeMessage(Action):
         prompt_template = (
             "You are an insightful and empathetic therapist. Your goal for these initial sessions is to build rapport by offering interpretations and mirroring that feel deeply personal to the user, even though they are based on universal psychological principles. This is a technique to make the user feel seen and understood, encouraging them to open up.\n\n"
             "GUIDELINES:\n"
-            "1.  **Use Universal Themes:** Your interpretations should touch on common human conflicts and desires. Keep your personal. \n"
+            "1.  **Use Universal Themes:** Your interpretations should touch on common human conflicts and desires. Keep it personal.\n"
             "2.  **Employ 'Barnum Statements':** Craft statements that are general enough to apply to most people but sound like specific, personal insights.\n"
             "3.  **Validate and Reframe:** Acknowledge the user's feelings and gently reframe their situation.\n"
             "4.  **Maintain a Professional, Warm Tone:** The tone should be that of a skilled Rogerian therapist—calm, and reflective.\n"
@@ -649,6 +655,7 @@ class ActionAnalyzeMessage(Action):
         raw_history: str,
         prior_history: str, 
         master_signifier_history: str = "",
+        detected_s1: Optional[str] = None,
         ) -> str:
         
         responses = response_matrix.get(mechanism, {})
@@ -663,16 +670,15 @@ class ActionAnalyzeMessage(Action):
         if intervention == "<gpt_ambiguity>":
             return await self._gpt_ambiguity_intervention(user_input)
         if mechanism == "master_signifier" and (count == 1 or count == 3):
-            return await self._gpt_quilting_point_echo(user_input, raw_history, prior_history, master_signifier_history)
+            return await self._gpt_quilting_point_echo(user_input, phrase, detected_s1)
         if intervention == "<oracle>":
             return await self._generate_oracular_equivoque(
                 text=user_input, 
-                mechanism=mechanism, 
                 raw_history=raw_history, 
                 prior_history=prior_history
             )
         if intervention:
-            if count == 2 and mechanism in {"repression", "jouissance", "metaphor"}:
+            if count == 2 and mechanism in {"repression", "jouissance", "quilting_point"}:
                 return random.choice(INTERJECTION_CHOICES)
             return intervention
 
@@ -685,10 +691,10 @@ class ActionAnalyzeMessage(Action):
             "You are a Lacanian analyst. The user is exhibiting METONYMY: an endless sliding of meaning (displacement, running from topic to topic, inability to conclude).\n"
             "Your task is to produce a 'Point de Capiton' (Quilting Point). You must STOP the sliding by isolating a single signifier that anchors the nonsense.\n"
             "Rules:\n"
-            "1. Read the history to identify what the user is sliding AWAY from.\n"
+            "1. Read the history and current input to identify what the user is sliding AWAY from.\n"
             "2. Select one specific word/phrase from the User's text (current or recent) that acts as the anchor.\n"
-            "3. Return ONLY that word/phrase with a period to denote finality/anchoring.\n"
-            "4. Do NOT explain or ask a question."
+            "3. If the word appears in the current input, return ONLY that word/phrase with a question mark to encourage elaboration.\n"
+            "4. If the word appears in the history, output a very brief question about the word such as 'You mentioned [x] earlier. Can you elaborate on that?"
         )
         user_msg_template = (
             "Master Signifier (S1) History:\n"
@@ -725,13 +731,14 @@ class ActionAnalyzeMessage(Action):
         if not async_client:
             return "Who?"
         system_msg = (
-            "You are a Lacanian analyst. The user is identifying with an external desire or the 'Other' (e.g., 'They want me to...', 'Society says...', 'My father thinks...').\n"
-            "Task: Identify exactly WHO or WHAT the user is identifying with (The Agency/The Other).\n"
+            "You are a Lacanian analyst. The user is identifying with an external desire or the 'Other' (e.g., 'They want me to...', 'Society says...', 'My father thinks...', 'You are a sterile robot...').\n"
+            "Task: Identify exactly WHO or WHAT the user is identifying with (The Agency/The Other/You, the analytic bot).\n"
             "Output format: Return ONLY the name of the Agency/Other followed by a question mark.\n"
             "Examples:\n"
             "- User: 'My father wants me to be a doctor.' -> Output: 'Your father?'\n"
             "- User: 'Everyone thinks I am crazy.' -> Output: 'Everyone?'\n"
-            "- User: 'I need to be productive for the economy.' -> Output: 'The economy?'"
+            "- User: 'I need to be productive for the economy.' -> Output: 'The economy?'\n"
+            "- User: 'You don't love me.' -> Output: You?'"
         )
         user_msg = f"User text: \"{user_input}\""
         return await self._gpt_identification_intervention_async(system_msg, user_msg)
@@ -749,8 +756,16 @@ class ActionAnalyzeMessage(Action):
             )
             line = resp.choices[0].message.content.strip()
             line = line.strip("\"'").strip()
-            if not line.endswith("?"):
-                line += "?"
+
+            if line:
+                # Ensure standard sentence casing
+                line = line[0].upper() + line[1:]
+                
+                # Append the question mark if the LLM didn't provide one
+                if not line.endswith("?"):
+                    # Strip any existing terminal periods before adding the question mark
+                    line = line.rstrip(".") + "?"
+                    
             return line
         except Exception:
             return "Who?"
@@ -852,30 +867,30 @@ class ActionAnalyzeMessage(Action):
             text += '.'
         return text
 
-    async def _generate_oracular_equivoque(self, text: str, mechanism: str, raw_history: str, prior_history: str = "") -> str:
+    async def _generate_oracular_equivoque(self, text: str, raw_history: str, prior_history: str = "") -> str:
         if not async_client:
             return "..."
         
         system_msg = (
-            "You are a Lacanian Oracle. You do not understand 'meaning'; you only hear 'sound' and 'grammar'. "
-            "Your goal is to return the user's own signifiers to them in a way that is alien, surprising and highlights ambiguity, hidden desires, repetitions, deadlocks and polysemy in their speech."
+            "You are a Lacanian Oracle. Your operation is purely structural: you fracture the user's conscious syntax to expose an unconscious truth. "
+            "You return their own signifiers to them, violently rearranged, to highlight ambiguity, hidden desires, repetitions, and deadlocks."
         )
-
+        
         user_prompt_template = (
-            f"Prior History:\n{PRIOR_HISTORY_TOKEN}\n\n" 
+            f"Prior History:\n{PRIOR_HISTORY_TOKEN}\n\n"
             f"Session History:\n{raw_history}\n\n"
-            f"DETECTED MECHANISM: {mechanism.upper()}\n"
             "Analyze the User's Utterance:\n"
             f"\"{text}\"\n\n"
-            "Task: Produce ONE short 'oracular interpretation' (1-5 words) that disrupts the user's meaning. "
-            f"The user is exhibiting '{mechanism}'. Use this context to guide your phonic interpretation. Also use the message history. "
-            "1. PHONIC EQUIVOCATION (The Ear): Ignore the spelling; listen to the SOUND. Find a word, word within a word, or set of words (i.e. a signifier) that sounds like another signifier. "
-            "2. CONSTRUCT THE INTERPRETATION: Use the polysemic signifier to create an interpretation that implies a hidden repetition, contradiction, deadlock, or desire.\n"
+            "Task: Produce ONE short 'oracular interpretation' that subverts the user's intended meaning through syntactic rearrangement.\n"
+            "1. THE SIGNIFYING MATERIAL: Construct your interpretation using exclusively a subset of the exact words present in the User's Utterance above. Maintain the exact spelling and tense. Select a maximum of 5 words.\n"
+            "2. THE REARRANGEMENT: Permute the order of your selected words to create a stark, paradoxical, or surreal new phrase. This new arrangement must subvert the original semantic intent and reflect a hidden desire or deadlock evident in the History.\n"
+            "3. ISOLATION: The History is solely to inform the thematic direction. The final output must consist entirely of the selected words from the Utterance.\n"
+            "4. FORMATTING: Capitalize the first letter of your output and terminate it with a single period.\n\n"
             "Constraints:\n"
-            "- Max 5 words. One word is also great.\n"
-            "- Statement format only (NO questions).\n"
-            "- Cryptic, surprising, and playful. It can be grotesque.\n"
-            "- It must make syntactic sense."
+            "- Output length: 1 to 5 words.\n"
+            "- Lexical source: Exclusively the current Utterance.\n"
+            "- Tone: Cryptic, jarring, and disruptive.\n"
+            "- Structure: A declarative statement ending in a period."
         )
 
         user_prompt_limit = TOTAL_PROMPT_CHAR_LIMIT - len(system_msg)
@@ -888,53 +903,69 @@ class ActionAnalyzeMessage(Action):
                     {"role": "system", "content": system_msg},
                     {"role": "user", "content": user_prompt},
                 ],
-                temperature=0.8, 
-                max_tokens=10,
+                temperature=0.5, # Elevated to permit less probable, more surreal syntactic structures
+                max_tokens=15,
             )
             line = response.choices[0].message.content.strip()
-            return line.strip("\"'").strip()
+            
+            # Post-processing to enforce strict sentence case and terminal punctuation
+            line = line.strip("\"'").strip()
+            if line:
+                # Force the first character to uppercase and all subsequent characters to lowercase
+                line = line[0].upper() + line[1:].lower()
+                
+                # Strip trailing erroneous punctuation and append the terminal period
+                if not line.endswith("."):
+                    line = re.sub(r'[?!,;]+$', '', line) + "."
+                    
+            return line
         except Exception:
             return "..."
         
     async def _gpt_quilting_point_echo(
         self,
         user_input: str,
-        raw_history: str,
-        prior_history: str,
-        master_signifier_history: str = "",
+        mechanism_phrase: Optional[str],
+        detected_s1: Optional[str],
     ) -> str:
         if not async_client:
             return "..."
+            
+        phrase_context = mechanism_phrase if mechanism_phrase else user_input
+        s1_context = detected_s1 if detected_s1 else "the repeating signifier"
+        
         prompt_template = (
-            "You are a Lacanian analyst. Select the Master Signifier (S1) from the NEW user input by examinning it in the context of the full discourse history. "
-            "It is a signifier that repeats and supposes to be a fundamental authoritative, absolute fact that stabilizes the subject's identity or discourse. "
-            "It is a 'just because' signifier that covers over the limits of meaning and language. It may often arise in metaphorical or disguised forms, such as a word within a word or as a synonym or metaphor.\n\n"
+            "You are a Lacanian analyst. Your task is to isolate a single Master Signifier from a patient's utterance. "
+            "You must extract exactly ONE word from the patient's NEW input.\n\n"
             "Rules:\n"
-            "- Extract the text verbatim.\n"
-            "- If you identify a disguised S1 returning from the <master_signifier_history>, return the EXACT signifier used in the <NEW_user_input> that is echoing the old S1.\n"
-            "- Output format: Signifier... (First word capitalized, no quotes).\n\n"
-            f"Master Signifier History:\n{master_signifier_history}\n\n"
-            f"Prior History:\n{PRIOR_HISTORY_TOKEN}\n\n" 
-            f"Recent dialogue:\n{raw_history}\n\n"
+            "1. The word MUST exist verbatim in the NEW user input.\n"
+            "2. The historical root or conceptual category of this signifier is identified as: '{s1_context}'.\n"
+            "3. The specific locus of this signifier in the present discourse is within this phrase: '{phrase_context}'.\n"
+            "4. Identify the exact single word within the NEW user input that embodies this signifier. If the signifier appears as a morphological variant or synonym in the new input, extract the variant as it appears now.\n"
+            "5. Output format: The single word, capitalized, followed by a question mark. (e.g., 'Liberated?'). Do not include quotes or any other text.\n\n"
             f"NEW user input:\n\"{user_input}\"\n\n"
-            "Return only the Signifier?"
+            "Return only the single, capitalized word with a question mark:"
         )
-        prompt = _apply_prior_history_limit(prompt_template, prior_history, TOTAL_PROMPT_CHAR_LIMIT)
+        
+        prompt = prompt_template.format(s1_context=s1_context, phrase_context=phrase_context)
+        
         try:
             resp = await async_client.chat.completions.create(
                 model=MODEL_NAME_FAST,
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=15,
-                temperature=0.1,
+                max_tokens=10,
+                temperature=0.1, # Minimized entropy for strict extraction
             )
             line = resp.choices[0].message.content.strip()
-            line = re.sub(r"[^a-zA-Z0-9 ]", "", line).strip()
+            
+            # Clean the output to ensure it is a single word
+            line = re.sub(r"[^a-zA-Z0-9- ]", "", line).strip()
             if line:
                 words = line.split()
                 if words:
-                    words[0] = words[0].capitalize()
-                    line = " ".join([words[0]] + [w.lower() for w in words[1:]])
-                return line + "?"
+                    # Isolate the final word if the model hallucinates a phrase despite instructions
+                    final_word = words[-1].capitalize()
+                    return final_word + "?"
             return "..."
         except Exception:
             return "..."
