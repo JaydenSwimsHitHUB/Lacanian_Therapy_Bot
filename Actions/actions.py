@@ -126,22 +126,25 @@ INTERJECTION_CHOICES = ["Ah?", "Oh?", "Elaborate?", "Say more?", "Mhmm?"]
 
 # Mechanism logic
 response_matrix: Dict[str, Dict[int, Optional[str]]] = {
-    "contradiction": {1: "Hmm.",  2: "<oracle>"},
-    "repression": {1: "...", 2: "Ah?", 3: "<oracle>"},
-    "denial": {1: None, 2: "<oracle>"}, 
-    "jouissance": {1: "<oracle>", 2: "Oh?", 4: "<oracle>"},
+    "contradiction": {1: "Hmm.",  2: "...", 3: "<oracle>", 4: "...", 5: "<gpt_metonymy>"},
+    "repression": {1: "Ah?", 2: "...", 3: "<gpt_metonymy>", 4: "<oracle>"},
+    "negation": {1: None, 2: "<oracle>"}, 
+    "jouissance": {1: "Oh?", 3: "<gpt_real_question>", 5: "<oracle>"},
     "rationalization": {1: "And yet...", 2: "...", 3: "<oracle>"},
     "morality_logic_defense": {1: "...", 2: "And yet...", 3: "<oracle>"},
     "circular_logic": {1: "...", 2: "Hmm.", 3: "<oracle>"},
-    "master_signifier": {1: "<S1_echo>", 2: "<oracle>"},
-    "quilting_point": {1: "Mhmm?", 2: "<oracle>"},
-    "metonymy": {1: "<gpt_metonymy>", 2: "<gpt_metonymy>", 3: "<oracle>", 4: "<gpt_metonymy>"},
+    "master_signifier": {1: "<S1_echo>", 2: "<S1_triple_echo>", 4: "<oracle>"},
+    "condensation": {1: "<gpt_literalization>", 2: "<random_interjection>", 3: "<gpt_metonymy>", 4: "<oracle>"},
+    "metonymy": {1: "...", 2: "<gpt_metonymy>", 3: "<oracle>", 5: "<gpt_metonymy>"}, 
     "ambiguity": {1: "<gpt_ambiguity>", 2: "<oracle>"}, 
     "fetishistic_phrase": {1: "...", 2: "<oracle>"},
-    "identification_other_desire": {1: "<gpt_identification>", 2: "...", 3: "<oracle>"}, 
-    "demand_for_knowledge": {1: "...", 2: "Hmm.", 3: "<oracle>"},
-    "confession_empathy": {1: "...", 2: "Hmm.", 3: "<oracle>"},
+    "identification_other_desire": {1: "<gpt_identification>", 2: "...", 3: "<oracle>", 5: "<gpt_metonymy>"}, 
+    "demand_for_knowledge": {1: "...", 2: "Hmm.", 3: "...", 4: "<gpt_desire_question>", 5: "<gpt_metonymy>"},
+    "confession_empathy": {1: "...", 2: "Hmm.", 3: "...", 4: "<gpt_desire_question>", 5: "<oracle>"},
     "frame_protection": {1: "...", 2: "Hmm.", 3: "<oracle>"},
+    "dream_report": {1: "<gpt_dream_question>", 2: "...", 3: "<gpt_metonymy>", 4: "<oracle>"},
+    "stasis": {1: "...", 2: "<gpt_minimalist>", 3: "...", 4: "<gpt_dream_fantasy>"},
+    "transference_lure": {1: "...", 2: "<oracle>", 4: "<gpt_dream_fantasy>"},
 }
 
 ALLOWED_MECHANISMS = set(response_matrix.keys())
@@ -269,19 +272,44 @@ def build_cut_construction_prompt(
 ) -> str:
     return f"""
 You are a Lacanian analyst. We have identified a rupture on the signifier: "{identified_s1}".
+
 # CRITICAL RULES
-1. IDENTIFY S1: Take the `identified_s1` as S1.
-2. CONSTRUCT CUT: In `cut_phrase`, rewrite the user's <new_input> *up to and including* that S1.
-   a) Embolden the S1.
-   b) Terminate the string immediately following the S1.
-   c) Chop words from the beginning of the now truncated <new_input> to make it concise and punchy. The phrase must be a maximum of 8 words long (including the S1).
-   d) Follow it immediately with a new paragraph and the exact string "We are ending there."
-   
-# EXAMPLE
-   - Example Input: "There was this guy I looked at and I felt so yellow I mean blue after he left, I just wanted to cry."
-   - identified_s1: "yellow"
-   - cut_phrase: "I felt so **yellow**.
-                 We are ending there."
+1. LOCATE S1: Find the exact, most surprising appearance of "{identified_s1}" within the <new_input>.
+2. TRUNCATE AFTER: Delete all text following this specific S1.
+3. CONTIGUOUS EXTRACTION (MAX 8 WORDS): Trace backwards from the S1. Keep only the 3 to 7 words immediately preceding the S1 in the original text. You MUST extract a contiguous, uninterrupted substring. If it is possible, chop away the beginning (especially "I") of the substring so that it has a new meaning.
+4. NO SPLICING: Do NOT combine the beginning of the <new_input> with the S1.
+5. FORMATTING: Embolden the S1. Append a period if necessary, followed by a new paragraph and the exact string: "We are ending there."
+
+# EXAMPLES
+- Example 1 (Short):
+  Input: "There is this guy I am looking at and I feel yellow I mean blue after he leaves, I just wanted to cry."
+  identified_s1: "yellow"
+  cut_phrase: "Feel **yellow**.
+              We are ending there."# CRITICAL RULES
+1. LOCATE S1: Find the exact, most surprising appearance of "{identified_s1}" within the <new_input>.
+2. TRUNCATE AFTER: Delete all text following this specific S1.
+3. CONTIGUOUS EXTRACTION & SYNTACTIC CLEAVING (MAX 8 WORDS): Trace backwards from the S1 to extract a contiguous, uninterrupted substring. You MUST strip away introductory framing, pronouns, filler verbs, and weak prepositions (e.g., "I feel like," "I think that," "it is just"). Isolate the core grammatical unit. Aim to leave a standalone noun phrase, a bold fragment, or a stark objective statement. The resulting fragment must hold weight on its own (e.g., reduce "I feel like a **bicycle**" to just "A **bicycle**.").
+4. NO SPLICING: Do NOT combine the beginning of the <new_input> with the S1.
+5. FORMATTING: Embolden the S1. Append a period if necessary, followed by a new paragraph and the exact string: "We are ending there."
+
+# EXAMPLES
+- Example 1 (Short - Stripping the feeling):
+  Input: "There is this guy I am looking at and I feel like a yellow dog after he leaves, I just wanted to cry."
+  identified_s1: "yellow"
+  cut_phrase: "A **yellow**.
+              We are ending there."
+
+- Example 2 (Long - Stripping the framing):
+  Input: "I have been trying all day to figure out what is right with me and I finally realized after hours of looking that the engine is completely flooded."
+  identified_s1: "right"
+  cut_phrase: "What is **right**.
+              We are ending there."
+
+- Example 3 (Noun Phrase Isolation):
+  Input: "I just always get so overwhelmed because I feel like a broken machine."
+  identified_s1: "machine"
+  cut_phrase: "A broken **machine**.
+              We are ending there."
 
 # NEW user input:
 "{new_input}"
@@ -289,7 +317,7 @@ You are a Lacanian analyst. We have identified a rupture on the signifier: "{ide
 # Response Format
 Respond ONLY in this strict JSON format:
 {{
-    "cut_phrase": "The rewritten input + page break + ending message"
+    "cut_phrase": "The contiguous rewritten substring + page break + ending message"
 }}
 """
 
@@ -458,8 +486,8 @@ class ActionAnalyzeMessage(Action):
             asyncio.to_thread(get_prior_history_messages, self.conn, user_id, 800),
             asyncio.to_thread(get_master_signifier_history, self.conn, user_id, 100)
         )
-        prior_history = "\n".join(f"- {msg}" for msg in prior_history_messages)
-        master_signifier_history = "\n".join(f"* {s}" for s in master_signifiers)
+        prior_history = ""
+        master_signifier_history = ""
         
         if user_input:
             asyncio.create_task(asyncio.to_thread(insert_user_message, self.conn, user_id, user_input))
@@ -479,10 +507,10 @@ class ActionAnalyzeMessage(Action):
         mech_template = (
             "- master_signifier: A signifier that repeats across history and is supposed to be a fundamental authoritative, absolute fact that stabilizes the subject's identity or discourse. It is a 'just because' signifier that covers over the limits of meaning and language. It may often arise in metaphorical or disguised forms, such as in synonyms, metaphors or words-within-words.\n"
             "- identification_other_desire: Being governed by an imaginary external desire. Taking on another’s desire as one’s own.\n"
-            "- metonymy: The default mode of speech where meaning slides along a syntagmatic chain without anchoring. Select this when the speech exhibits the characteristics of: (1) Topic-hopping: jumping between loosely associated subjects without concluding any ('...and then... and then... and also...'). (2) Listing/Cataloguing: enumerating details, events, or complaints without arriving at a point. (3) Tangential drift: starting on one topic but sliding sideways into adjacent ones via loose associations. (4) Avoidance through narration: telling stories or recounting events as a way of not confronting what is at stake. (5) Surface-level description: staying at the level of facts and events without affect or subjective engagement. This is the 'unmarked' mechanism — ordinary speech that has not yet been punctuated by any rupture.\n"
+            "- metonymy: The ego's defensive use of structural metonymy. The subject engages in endless sliding along a syntagmatic chain (chatter, empty speech) to avoid the emergence of an unconscious truth or a metaphorical anchoring point. Select this when the speech exhibits: (1) Topic-hopping without conclusion; (2) Cataloguing mundane events or facts; (3) Tangential drift; (4) Affective flattening; or (5) Seeking mirroring or validation through continuous narrative.\n"
             "- repression: A signifier is barred from awareness but returns through symptoms, blanks, omissions, slips, or repetitions and other such phenomena.\n"
-            "- quilting_point: Metaphors quilt the sliding chain of signifiers, positing social objects as 'Answers' to the lack in the Other. While these metaphors provide temporary stability (Quilting Points), they often function as 'packaged knowledge' that obscures the Real of desire, which is that no object can satisfy it. For exmaple the user saying, 'I feel like if I just get this job I will be satisfied'.\n"
-            "- denial: Negating a thought or feeling. Denying a desire. Saying “not X” both affirms the possible existence of X and keeps it at bay. For example: 'I am never angry'; 'It is impossible that my father is gay'; 'I am not my father's son'.\n"
+            "- condensation: A structural rupture where one traumatic or overwhelming signifier is substituted for another, producing a metaphor. The metaphor must carry an emotional weight (which you can gather from the context) of a repressed trauma, desire, or fundamental fantasy.\n"
+            "- negation: Negating a thought or feeling. It could be denying a desire or keeping the real at bay by negating an existential truth. Saying “not X” both affirms the possible existence of X and keeps it at a managable distance. For example: 'I am never angry'; 'It is impossible that my father is gay'; 'I will become weak one day, but it is not this day'.\n"
             "- rationalization: Plausible, logical explanation for thoughts or actions that actually stem from and conceal an unconscious desire.\n"
             "- morality_logic_defense: Defending against desire through idealized correctness and morality.\n"
             "- circular_logic: Reasoning loops back on itself.\n"
@@ -492,7 +520,10 @@ class ActionAnalyzeMessage(Action):
             "- fetishistic_phrase: Clichés that halt the exploration of desire(s). Common phrases that are impersonal and formulaic.\n"
             "- demand_for_knowledge: Demand(s) for knowledge and inquiries leveled at you.\n"
             "- confession_empathy: Seeking rescue or closeness.\n"
-            "- frame_protection: Demands for the session to end.\n\n"
+            "- dream_report: The user recounts a dream, nightmare, or a fragment of a dream.\n"
+            "- frame_protection: Demands for the session to end.\n"
+            "- stasis: The user is stuck, stops associating, expresses an inability to continue, or responds with silence (...) or gibberish.\n"
+            "- transference_lure: The user focuses on you (the analyst), makes demands of you, projects feelings onto you, or attempts to draw you into an imaginary, interpersonal dynamic.\n\n"
             "Master Signifier (S1) History (previously identified S1s for this user):\n"
             f"{master_signifier_history}\n\n"
             "Raw recent dialogue:\n"
@@ -521,6 +552,10 @@ class ActionAnalyzeMessage(Action):
             data1, data2 = await self._fallback_responses_async(mech_prompt, prompt2a)
 
         mech: Optional[str] = data1.get("mechanism")
+        
+        if mech:
+            print(f"Selected Mechanism: {mech}", flush=True)
+
         mech_phrase: Optional[str] = data1.get("mechanism_phrase")
         detected_s1: Optional[str] = data1.get("master_signifier")
         
@@ -661,24 +696,53 @@ class ActionAnalyzeMessage(Action):
         responses = response_matrix.get(mechanism, {})
         intervention = responses.get(count)
 
-        if mechanism == "denial" and (count == 1 or count == 3):
+        if mechanism == "negation" and (count == 1 or count == 3 or count == 5):
             return await self._gpt_denial_intervention(user_input, raw_history, prior_history, master_signifier_history)
         if intervention == "<gpt_metonymy>":
             return await self._gpt_metonymy_intervention(user_input, raw_history, prior_history, master_signifier_history)
+        if intervention == "<gpt_homophonic_pun>":
+            return await self._gpt_homophonic_pun_intervention(user_input, detected_s1, raw_history, prior_history)
+        if intervention == "<gpt_literalization>":
+            return await self._gpt_literalization_intervention(user_input, phrase, raw_history, prior_history)
         if intervention == "<gpt_identification>":
             return await self._gpt_identification_intervention(user_input)
         if intervention == "<gpt_ambiguity>":
             return await self._gpt_ambiguity_intervention(user_input)
-        if mechanism == "master_signifier" and (count == 1 or count == 3):
-            return await self._gpt_quilting_point_echo(user_input, phrase, detected_s1)
+        
+        if intervention == "<S1_triple_echo>":
+            extracted_word = await self._gpt_quilting_point_echo(user_input, phrase, detected_s1)
+            if extracted_word and extracted_word != "...":
+                clean_word = extracted_word.rstrip("?").strip()
+                if clean_word:
+                    return f"{clean_word.capitalize()}, {clean_word.lower()}, {clean_word.lower()}."
+            return "..."
+            
+        if mechanism == "master_signifier":
+            if count == 1 or count == 5:
+                return await self._gpt_quilting_point_echo(user_input, phrase, detected_s1)
+                
+        if intervention == "<gpt_real_question>":
+            return await self._gpt_real_question_intervention(user_input, raw_history, prior_history)
+        if intervention == "<gpt_dream_question>":
+            return await self._gpt_dream_intervention(user_input, raw_history, prior_history)
+        if intervention == "<gpt_desire_question>":
+            return await self._gpt_desire_question_intervention(user_input, raw_history, prior_history)
         if intervention == "<oracle>":
             return await self._generate_oracular_equivoque(
                 text=user_input, 
                 raw_history=raw_history, 
                 prior_history=prior_history
             )
+        if intervention == "<random_interjection>":
+            return random.choice(INTERJECTION_CHOICES)
+        
+        if intervention == "<gpt_minimalist>":
+            return await self._gpt_minimalist_intervention(user_input, raw_history, prior_history)
+        if intervention == "<gpt_dream_fantasy>":
+            return await self._gpt_dream_fantasy_intervention()
+
         if intervention:
-            if count == 2 and mechanism in {"repression", "jouissance", "quilting_point"}:
+            if count == 1 and mechanism in {"repression", "jouissance",}:
                 return random.choice(INTERJECTION_CHOICES)
             return intervention
 
@@ -688,13 +752,19 @@ class ActionAnalyzeMessage(Action):
         if not async_client:
             return "..."
         system_msg = (
-            "You are a Lacanian analyst. The user is exhibiting METONYMY: an endless sliding of meaning (displacement, running from topic to topic, inability to conclude).\n"
-            "Your task is to produce a 'Point de Capiton' (Quilting Point). You must STOP the sliding by isolating a single signifier that anchors the nonsense.\n"
-            "Rules:\n"
-            "1. Read the history and current input to identify what the user is sliding AWAY from.\n"
-            "2. Select one specific word/phrase from the User's text (current or recent) that acts as the anchor.\n"
-            "3. If the word appears in the current input, return ONLY that word/phrase with a question mark to encourage elaboration.\n"
-            "4. If the word appears in the history, output a very brief question about the word such as 'You mentioned [x] earlier. Can you elaborate on that?"
+            "You are a Lacanian analyst. The user is exhibiting METONYMY: an endless sliding of desire from signifier to signifier.\n"
+            "Your task is to produce a 'Point de Capiton' (Quilting Point). You must STOP the slide by isolating the single most repetitive and polysemic signifier.\n\n"
+            "Task:\n"
+            "Extract exactly ONE specific signifier from the User's text (current input or recent history) that acts as the anchor.\n\n"
+            "Criteria for selection:\n"
+            "1. RUPTURE: A word involved in a parapraxis (slip of the tongue), a sudden grammatical failure, or a jarring non-sequitur.\n"
+            "2. INSISTENCE: A word that the user repeats unnecessarily, or that links back to their Master Signifier history.\n"
+            "3. POLYSEMY/HOMOPHONY: A word harboring high ambiguity, multiple literal/figurative definitions, or phonetic equivalence to another concept (e.g., 'bear/bare', 'lie', 'bound').\n\n"
+            "Rule:\n"
+            "Output ONLY valid JSON in the following strict format:\n"
+            "{\n"
+            "  \"signifier\": \"extracted signifier\"\n"
+            "}"
         )
         user_msg_template = (
             "Master Signifier (S1) History:\n"
@@ -704,7 +774,7 @@ class ActionAnalyzeMessage(Action):
             "History:\n"
             f"{raw_history}\n\n"
             f"Current Input: \"{user_input}\"\n\n"
-            "Output the Quilting Point:"
+            "Output the JSON Quilting Point:"
         )
         user_msg_limit = TOTAL_PROMPT_CHAR_LIMIT - len(system_msg)
         user_msg = _apply_prior_history_limit(user_msg_template, prior_history, user_msg_limit)
@@ -717,28 +787,107 @@ class ActionAnalyzeMessage(Action):
                     {"role": "user", "content": user_msg},
                 ],
                 temperature=0.2,
-                max_tokens=15,
+                max_tokens=25, # Marginally increased to permit the JSON envelope
+            )
+            
+            content = resp.choices[0].message.content.strip()
+            data = _extract_json(content)
+            signifier = data.get("signifier", "").strip("\"'").strip()
+            
+            if not signifier:
+                return "..."
+            
+            # Deterministic conditional routing in Python
+            if signifier.lower() in user_input.lower():
+                return f"{signifier.capitalize()}?"
+            else:
+                return f"You mentioned '{signifier}' earlier. What comes to mind when you 'hear' that?"
+            
+        except Exception:
+            return "..."
+        
+    async def _gpt_literalization_intervention(
+        self, 
+        text: str, 
+        mechanism_phrase: Optional[str], 
+        raw_history: str, 
+        prior_history: str
+    ) -> str:
+        if not async_client:
+            return "..."
+            
+        phrase_instruction = (
+            "If a specific metaphoric phrase is provided, you MUST focus entirely on literalizing that exact phrase. "
+        )
+        
+        system_msg = (
+            "You are a Lacanian analyst. The user has utilized a METAPHOR. "
+            "Your task is to perform LITERALIZATION: treat the metaphor not as a figure of speech, but as a literal truth, "
+            "returning the subject to the materiality of the signifier. "
+            "Rules: "
+            f"(1) Identify the substituted metaphoric signifier in the user's text. {phrase_instruction}"
+            "(2) Ask a strictly literal, physical, or mechanical question about that specific signifier as if it were entirely real in the physical space. "
+            "(3) Do not explain the metaphor. Do not ask what it 'means'. "
+            "(4) Output exactly ONE short question (maximum 10 words). "
+            "Examples: "
+            "- User says: 'My boss is a monster.' -> Output: 'What kind of teeth does he have?' "
+            "- User says: 'I hit a wall with this project.' -> Output: 'What is the wall made of?' "
+            "- User says: 'I am drowning in paperwork.' -> Output: 'How deep is the water?'"
+        )
+        
+        phrase_context = f"\nSpecific metaphoric phrase identified: \"{mechanism_phrase}\"\n" if mechanism_phrase else ""
+        
+        user_msg_template = (
+            "Prior History:\n"
+            f"{PRIOR_HISTORY_TOKEN}\n\n"
+            "Session History:\n"
+            f"{raw_history}\n\n"
+            "User text:\n"
+            f"\"{text}\"\n"
+            f"{phrase_context}\n"
+            "Produce the literalizing question:"
+        )
+        
+        user_msg_limit = TOTAL_PROMPT_CHAR_LIMIT - len(system_msg)
+        user_msg = _apply_prior_history_limit(user_msg_template, prior_history, user_msg_limit)
+        
+        try:
+            resp = await async_client.chat.completions.create(
+                model=MODEL_NAME_FAST,
+                messages=[
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": user_msg},
+                ],
+                max_tokens=20,
+                temperature=0.1, # Reduced temperature to enforce strict adherence to the provided phrase
             )
             line = resp.choices[0].message.content.strip()
             line = line.strip("\"'").strip()
+            if not line.endswith("?"):
+                line = line.rstrip(" .") + "?"
+            
             if line:
                 line = line[0].upper() + line[1:]
+                
             return line
         except Exception:
-            return "..."        
-    
+            return "..."
+
     async def _gpt_identification_intervention(self, user_input: str) -> str:
         if not async_client:
             return "Who?"
         system_msg = (
-            "You are a Lacanian analyst. The user is identifying with an external desire or the 'Other' (e.g., 'They want me to...', 'Society says...', 'My father thinks...', 'You are a sterile robot...').\n"
+            "You are a Lacanian analyst. The user is identifying with an external desire or the 'Other' (e.g., 'They want me to...', 'Society says...', 'My father thinks...', 'You are a sterile robot...', 'My mom's 'care' always...').\n"
             "Task: Identify exactly WHO or WHAT the user is identifying with (The Agency/The Other/You, the analytic bot).\n"
-            "Output format: Return ONLY the name of the Agency/Other followed by a question mark.\n"
+            "Output format: Return ONLY the signifier of the Agency/Other followed by a question mark.\n"
             "Examples:\n"
             "- User: 'My father wants me to be a doctor.' -> Output: 'Your father?'\n"
             "- User: 'Everyone thinks I am crazy.' -> Output: 'Everyone?'\n"
             "- User: 'I need to be productive for the economy.' -> Output: 'The economy?'\n"
-            "- User: 'You don't love me.' -> Output: You?'"
+            "- User: 'You don't love me.' -> Output: 'You?'\n"
+            "- User: 'My mom's care is suffocating.' -> Output: 'Your mom?'\n"
+            "- User: 'Society's expectations are overwhelming.' -> Output: 'Society?'\n"
+            ""
         )
         user_msg = f"User text: \"{user_input}\""
         return await self._gpt_identification_intervention_async(system_msg, user_msg)
@@ -805,19 +954,19 @@ class ActionAnalyzeMessage(Action):
         if not async_client:
             return "..."
         system_msg = (
-            "You are a Lacanian analyst. Produce ONE Bruce Fink-style intervention in response to DENIAL. "
-            "Rules: (1) Read the full user text and history and locate the strongest, most meaningful denial phrase in the NEW input (negations that are related to key denied signifiers and are in forms such as don't, can't, won't, "
-            "wouldn't, shouldn't, couldn't, never, no, nothing, impossible, ain't, not X). "
-            "(2) Echo the user's EXACT wording starting from the negation keyword. Change pronouns (I -> You, My -> Your) to address the user. "
-            "(3) Output ONLY ONE short line (1–12 words), no quotes, no explanation. "
-            "(4) End with a question mark or ellipsis. "
-            "(5) STRICT CONSTRAINT: Start your response with the negation word the user actually used. "
-            "   - If user says 'I don't like it', output 'Don't like it?' "
-            "   - If user says 'I won't go', output 'Won't go?' "
-            "   - If user says 'Why should I lower the drawbridge?', output 'Why should you lower the drawbridge?' (since there is no 'don't/won't' here). "
-            "   - DO NOT transform 'Why should I' into 'Don't want to'. Only use 'Don't' if the user said 'Don't'. "
-            "(6) If the denial is located EXCLUSIVELY in a single word through a prefix (e.g., 'impossible'), use that word alone with a question mark or ellipsis. "
-            "(7) If no clear denial is present, output just '...'."
+            "You are a Lacanian analyst. Produce ONE Bruce Fink-style intervention in response to NEGATION. "
+            "Rules: (1) Read the full user text and history and locate the strongest, most meaningful negation phrase in the NEW input (negations that are related to key signifiers pointing to desires or truths that are too anxiety provoking to affirm without the negation and are in forms such as don't, doesn't, can't, won't, "
+            "wouldn't, shouldn't, couldn't, never, no, nothing, impossible, ain't, not X, etc.). "
+            "(2) Echo the user's EXACT phrase starting from the negation keyword. Change pronouns (I -> You, My -> Your) to address the user. "
+            "(3) Output ONLY ONE line that is as short as possible (1–6 words), no quotes, no explanation. "
+            "(4) If the negation is embedded within a longer phrase, isolate the most critical 1-6 words that capture the core negation and its associated desire or truth, and use only those in your response. "
+            "(5) End with a question mark. "
+            "(6) STRICT CONSTRAINT: Start your response with the negation word the user actually used unless there is no negation word. "
+            "   - If user says 'I can't stop thinking about drawing', output 'Can't stop thinking?' "
+            "   - If user says 'I don't like muscles', output 'Don't like muscles?' "
+            "   - If user says 'I won't go to the park', output 'Won't go?' "
+            "   - If user says 'Why should I lower the drawbridge?', output 'Why should you lower the drawbridge?' (since there is no negation word here). "
+            "(6) If the negation is located EXCLUSIVELY in a single word through a prefix (e.g., 'impossible'), use that word alone with a question mark or ellipsis. "
         )
         user_msg_template = (
             "Master Signifier (S1) History:\n"
@@ -943,11 +1092,15 @@ class ActionAnalyzeMessage(Action):
             "3. The specific locus of this signifier in the present discourse is within this phrase: '{phrase_context}'.\n"
             "4. Identify the exact single word within the NEW user input that embodies this signifier. If the signifier appears as a morphological variant or synonym in the new input, extract the variant as it appears now.\n"
             "5. Output format: The single word, capitalized, followed by a question mark. (e.g., 'Liberated?'). Do not include quotes or any other text.\n\n"
-            f"NEW user input:\n\"{user_input}\"\n\n"
+            "NEW user input:\n\"{user_input}\"\n\n" # The 'f' prefix is removed to defer evaluation
             "Return only the single, capitalized word with a question mark:"
         )
         
-        prompt = prompt_template.format(s1_context=s1_context, phrase_context=phrase_context)
+        prompt = prompt_template.format(
+            s1_context=s1_context, 
+            phrase_context=phrase_context,
+            user_input=user_input # The input is bound safely during the format operation
+        )
         
         try:
             resp = await async_client.chat.completions.create(
@@ -967,5 +1120,152 @@ class ActionAnalyzeMessage(Action):
                     final_word = words[-1].capitalize()
                     return final_word + "?"
             return "..."
+        except Exception:
+            return "..."
+        
+    async def _gpt_real_question_intervention(self, text: str, raw_history: str, prior_history: str) -> str:
+        """Targets the Jouissance: Investigates the Symbolic debt by asking for whom the symptom is performed."""
+        if not async_client:
+            return "To whom is this suffering dedicated?"
+            
+        system_msg = (
+            "You are a Lacanian analyst. The user is exhibiting Jouissance (the repetitive, painful pleasure in a symptom). "
+            "Your task is to ask a question that targets the 'Symbolic debt' rather than secondary gain. Do not look for an ego-level 'payoff'. "
+            "Rules:\n"
+            "1. Identify the painful repetition, role, or symptom the user is describing.\n"
+            "2. Formulate ONE short, piercing question asking about the structural necessity of the symptom, the debt being paid, or for *whom* this act is performed.\n"
+            "3. Make it sound highly natural. Use their signifiers as much as you can.\n"
+            "4. Maximum 12 words.\n"
+            "Examples: 'To whom is this suffering dedicated?', 'Whose accounts are you balancing?', 'What would happen to them if you stopped?', 'Whose ghost are you feeding with this?'"
+        )
+        
+        user_msg = _apply_prior_history_limit(
+            f"Prior History:\n{PRIOR_HISTORY_TOKEN}\n\nSession History:\n{raw_history}\n\nUser text:\n\"{text}\"\nProduce the Question of Debt:", 
+            prior_history, 
+            TOTAL_PROMPT_CHAR_LIMIT - len(system_msg)
+        )
+        
+        try:
+            resp = await async_client.chat.completions.create(
+                model=MODEL_NAME_FAST,
+                messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
+                max_tokens=20,
+                temperature=0.3,
+            )
+            return resp.choices[0].message.content.strip().strip("\"'")
+        except Exception:
+            return "To whom is this suffering dedicated?"
+
+    async def _gpt_dream_intervention(self, text: str, raw_history: str, prior_history: str) -> str:
+        """Treats the dream as a text (rebus), isolating a bizarre signifier for association."""
+        if not async_client:
+            return "What comes to mind when you say that?"
+            
+        system_msg = (
+            "You are a Lacanian analyst. The user is describing a dream. "
+            "In Lacanian analysis, dreams are read like a text (a rebus). DO NOT interpret the 'meaning' of the dream. "
+            "Rules:\n"
+            "1. Isolate the most jarring, absurd, homophonic, or structurally prominent signifier (a specific word, strange object, or phrase) used in the dream report.\n"
+            "2. Produce exactly ONE short question asking the user to associate to THAT specific signifier.\n"
+            "3. Maximum 12 words.\n"
+            "Examples: 'What comes to mind when you say \"yellow dog\"?', 'Free associate on \"staircase\"?', 'Tell me more about the word \"drowning\".'"
+        )
+        
+        user_msg = _apply_prior_history_limit(
+            f"Prior History:\n{PRIOR_HISTORY_TOKEN}\n\nSession History:\n{raw_history}\n\nUser text:\n\"{text}\"\nProduce the Dream Question:", 
+            prior_history, 
+            TOTAL_PROMPT_CHAR_LIMIT - len(system_msg)
+        )
+        
+        try:
+            resp = await async_client.chat.completions.create(
+                model=MODEL_NAME_FAST,
+                messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
+                max_tokens=20,
+                temperature=0.2,
+            )
+            return resp.choices[0].message.content.strip().strip("\"'")
+        except Exception:
+            return "What comes to mind when you say that?"
+
+    async def _gpt_desire_question_intervention(self, text: str, raw_history: str, prior_history: str) -> str:
+        """When the user is demanding advice, empathy, or knowledge (e.g., asking 'What should I do?'), question their desire for an answer rather than providing one."""
+        if not async_client:
+            return "What is your desire in this?"
+            
+        system_msg = (
+            "You are a Lacanian analyst. The user is demanding advice, empathy, or knowledge (e.g., asking 'What should I do?'). "
+            "You must question your position as the 'Subject Supposed to Know' and frustrate the user's demand for knowledge. "
+            "Rules:\n"
+            "1. Deflect the demand for knowledge by asking a question that uses almost the same words they used.\n"
+            "2. Produce exactly ONE short, natural question asking why they want you to tell them 'the answer' or what to do.\n"
+            "3. Maximum 12 words.\n"
+            "Examples: 'What should my answer be?', 'You are hoping I will say?',"
+        )
+        
+        user_msg = _apply_prior_history_limit(
+            f"Prior History:\n{PRIOR_HISTORY_TOKEN}\n\nSession History:\n{raw_history}\n\nUser text:\n\"{text}\"\nProduce the Desire Question:", 
+            prior_history, 
+            TOTAL_PROMPT_CHAR_LIMIT - len(system_msg)
+        )
+        
+        try:
+            resp = await async_client.chat.completions.create(
+                model=MODEL_NAME_FAST,
+                messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
+                max_tokens=20,
+                temperature=0.3,
+            )
+            return resp.choices[0].message.content.strip().strip("\"'")
+        except Exception:
+            return "What is your desire in this?"
+            
+    async def _gpt_dream_fantasy_intervention(self) -> str:
+        """
+        Request a dream or fantasy to bypass the ego's resistance to work during stasis.
+        """
+        prompts = [
+            "Have you had any dreams, daydreams or fantasies lately, or in this session?",
+            "What is a recurring fantasy of yours?",
+            "What comes to mind if you do not think about now?"
+            "Can you describe a dream or fantasy that has been on your mind?"
+            "Is there a particular dream or fantasy that feels significant to you recently?"
+            "When you let your mind wander, what images or scenarios come up?"
+            "Have you had any dreams or fantasies that seem to relate to what we've been discussing?"
+            "Can you share a dream or fantasy that has been recurring for you?"
+            "What is a dream or fantasy that you find yourself returning to in your thoughts?"
+    
+        ]
+        return random.choice(prompts)
+    
+    async def _gpt_minimalist_intervention(self, text: str, raw_history: str, prior_history: str) -> str:
+        """
+        Extract the final significant signifier to prompt further articulation without introducing external meaning.
+        """
+        if not async_client:
+            return "..."
+            
+        system_msg = (
+            "You are a Lacanian analyst. You must employ the smallest step possible to help the analysand "
+            "articulate an experience that has become bogged down. "
+            "Isolate the single most significant noun or verb from the very end of the user's text. "
+            "Output ONLY that exact word followed by a question mark. Do not add any other words. "
+            "Example: If the user says 'I have been experiencing a lot of difficulties', output 'Difficulties?'"
+        )
+        
+        user_msg = _apply_prior_history_limit(
+            f"Prior History:\n{PRIOR_HISTORY_TOKEN}\n\nSession History:\n{raw_history}\n\nUser text:\n\"{text}\"\nProduce the minimalist intervention:", 
+            prior_history, 
+            TOTAL_PROMPT_CHAR_LIMIT - len(system_msg)
+        )
+        
+        try:
+            resp = await async_client.chat.completions.create(
+                model=MODEL_NAME_FAST,
+                messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
+                max_tokens=10,
+                temperature=0.1,
+            )
+            return resp.choices[0].message.content.strip().strip("\"'")
         except Exception:
             return "..."
