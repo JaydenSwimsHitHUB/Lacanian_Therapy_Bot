@@ -5,6 +5,7 @@ import random
 import sqlite3
 import asyncio
 import threading  # For the synchronous timer
+import datetime
 from typing import Any, Text, Dict, List, Optional, Tuple
 
 from openai import AsyncOpenAI
@@ -76,11 +77,41 @@ def get_master_signifier_history(db_path: str, user_id: str, limit: int = 100) -
         cursor = conn.execute(query, (user_id, limit))
         return [row[0] for row in cursor.fetchall()]
 
+def clear_user_master_signifiers_before(db_path: str, user_id: str, timestamp: str) -> None:
+    with sqlite3.connect(db_path, timeout=10.0) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("DELETE FROM master_signifiers WHERE user_id = ? AND timestamp < ?", (user_id, timestamp))
+        conn.commit()
+
+def _insert_master_signifiers_batch(db_path: str, user_id: str, s1_list: List[Dict[str, Any]]) -> None:
+    with sqlite3.connect(db_path, timeout=10.0) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        for item in s1_list:
+            if not isinstance(item, dict):
+                continue
+            sig = item.get("signifier")
+            if not sig or not isinstance(sig, str):
+                continue
+            sig_clean = sig.strip()
+            phrase = item.get("phrase", "").strip()
+            if not sig_clean:
+                continue
+            cursor = conn.execute(
+                "SELECT 1 FROM master_signifiers WHERE user_id = ? AND signifier = ? COLLATE NOCASE LIMIT 1",
+                (user_id, sig_clean)
+            )
+            if cursor.fetchone() is None:
+                conn.execute(
+                    "INSERT INTO master_signifiers (user_id, signifier, phrase) VALUES (?, ?, ?)",
+                    (user_id, sig_clean, phrase)
+                )
+        conn.commit()
+
 def _insert_master_signifier(db_path: str, user_id: str, signifier: str, phrase: str) -> None:
     with sqlite3.connect(db_path, timeout=10.0) as conn:
         conn.execute("PRAGMA journal_mode=WAL")
         cursor = conn.execute(
-            "SELECT 1 FROM master_signifiers WHERE user_id = ? AND signifier = ? LIMIT 1",
+            "SELECT 1 FROM master_signifiers WHERE user_id = ? AND signifier = ? COLLATE NOCASE LIMIT 1",
             (user_id, signifier)
         )
         if cursor.fetchone() is None:
@@ -321,12 +352,18 @@ class ActionSessionStartCustom(Action):
     def name(self) -> Text:
         return "action_session_start_custom"
 
-    def run(
+    async def run(
         self,
         dispatcher: CollectingDispatcher,
         tracker: Tracker,
         domain: Dict[Text, Any],
     ) -> List[EventType]:
+        
+        user_id = tracker.sender_id
+        
+        # Initiate asynchronous background extraction and replacement of S1s
+        asyncio.create_task(self._extract_and_replace_s1s(user_id))
+
         return [
             SessionStarted(),
             SlotSet("session_thematic_count", 0),
@@ -336,6 +373,73 @@ class ActionSessionStartCustom(Action):
             SlotSet("dream_fantasy_asked", False),
             ActionExecuted("action_listen"),
         ]
+
+    async def _extract_and_replace_s1s(self, user_id: str) -> None:
+        """
+        Background worker that processes the entire history at session start.
+        Extracts up to 20 master signifiers, purges the old database entries,
+        and inserts the newly generated list to enforce a strict cap.
+        """
+        if not async_client:
+            return
+            
+        try:
+            # Capture exact time prior to execution to avoid deleting concurrent live-session data
+            session_start_time = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+
+            prior_history_messages = await asyncio.to_thread(get_prior_history_messages, DB_PATH, user_id, 800)
+            if not prior_history_messages:
+                return
+                
+            prior_history_text = "\n".join(f"- {msg}" for msg in prior_history_messages)
+            
+            system_msg = (
+                "You are a Lacanian analyst. Your task is to review the patient's long-term history "
+                "and identify their 'Master Signifiers' (S1s). "
+                "An S1 is a signifier that repeats across history, often with low probability given what was uttered immediately before, "
+                "and is thus ostensibly a fundamental authoritative, absolute fact that stabilizes the subject's identity or discourse. "
+                "It is a 'just because' signifier that covers over the limits of meaning and language. "
+                "It may return in disguised forms, such as in synonyms, homophones, homonyms, metaphors or words-within-words\n\n"
+                "Extract a list of MAXIMUM 20 of the most significant S1s based on the entire history provided.\n\n"
+                "Be strict and only return signifiers that clearly match the criteria for Master Signifiers.\n\n"
+                "Output ONLY valid JSON in the following strict format:\n"
+                "{\n"
+                "  \"new_s1s\": [\n"
+                "    {\"signifier\": \"extracted signifier\", \"phrase\": \"the contextual phrase it appeared in\"}\n"
+                "  ]\n"
+                "}"
+            )
+            
+            user_msg_template = (
+                f"Prior History:\n{PRIOR_HISTORY_TOKEN}\n\n"
+                "Identify the top 20 most important Master Signifiers from the Prior History."
+            )
+            
+            user_msg_limit = TOTAL_PROMPT_CHAR_LIMIT - len(system_msg)
+            user_msg = _apply_prior_history_limit(user_msg_template, prior_history_text, user_msg_limit)
+            
+            resp = await async_client.chat.completions.create(
+                model=MODEL_NAME_REASONING,
+                messages=[
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": user_msg}
+                ],
+                temperature=0.2,
+                max_tokens=1500
+            )
+            
+            content = resp.choices[0].message.content.strip()
+            data = _extract_json(content)
+            new_s1s = data.get("new_s1s")
+            
+            if isinstance(new_s1s, list):
+                # Target deletion strictly to S1s created before this job initiated
+                await asyncio.to_thread(clear_user_master_signifiers_before, DB_PATH, user_id, session_start_time)
+                
+                # Batch insert avoiding the N+1 thread generation problem
+                await asyncio.to_thread(_insert_master_signifiers_batch, DB_PATH, user_id, new_s1s[:20])
+        except Exception as e:
+            print(f"Error extracting and replacing S1s on session start: {e}", flush=True)
 
 class ActionAnalyzeMessage(Action):
     def __init__(self):
@@ -518,7 +622,7 @@ class ActionAnalyzeMessage(Action):
         # ==== PASS 1: Local mechanism identification ===#
         allowed = list(ALLOWED_MECHANISMS)
         mech_template = (
-            "- master_signifier: A signifier that repeats across history and is supposed to be a fundamental authoritative, absolute fact that stabilizes the subject's identity or discourse. It is a 'just because' signifier that covers over the limits of meaning and language. It may often arise in metaphorical or disguised forms, such as in synonyms, metaphors or words-within-words.\n"
+            "- master_signifier: A signifier that repeats across history, often with low probability given what was uttered immediately before, and is thus ostensibly a fundamental authoritative, absolute fact that stabilizes the subject's identity or discourse. It is a 'just because' signifier that covers over the limits of meaning and language. It may return in disguised forms, such as in synonyms, homophones, homonyms, metaphors or words-within-words.\n"
             "- identification_other_desire: Being governed by an imaginary external desire. Taking on another’s desire as one’s own.\n"
             "- transference_love: Seeking validation by saying what they believe you (the analyst) wants to hear.\n"
             "- metonymy: The ego's defensive use of structural metonymy. The subject engages in endless sliding along a syntagmatic chain (chatter, empty speech) to avoid the emergence of an unconscious truth or a metaphorical anchoring point. Select this when the speech exhibits: (1) Topic-hopping without conclusion; (2) Cataloguing mundane events or facts; (3) Tangential drift; (4) Affective flattening; or (5) Seeking mirroring or validation through continuous narrative.\n"
@@ -575,8 +679,12 @@ class ActionAnalyzeMessage(Action):
         mech_phrase: Optional[str] = data1.get("mechanism_phrase")
         detected_s1: Optional[str] = data1.get("master_signifier")
         
+        # Enforce strict length constraint to prohibit the corruption of S1 context by multi-word sentences
         if not detected_s1 and mech == "master_signifier" and mech_phrase:
-            detected_s1 = mech_phrase
+            if len(mech_phrase.split()) <= 4:
+                detected_s1 = mech_phrase
+            else:
+                detected_s1 = None
             
         if detected_s1 and isinstance(detected_s1, str) and detected_s1.strip():
             s1_clean = detected_s1.strip()
@@ -1167,7 +1275,7 @@ class ActionAnalyzeMessage(Action):
             "1. The signifier MUST exist verbatim in the NEW user input.\n"
             "2. The historical root or conceptual category of this signifier is identified as: '{s1_context}'.\n"
             "3. The specific locus of this signifier in the present discourse is within this phrase: '{phrase_context}'.\n"
-            "4. Identify the exact single signifier within the NEW user input that embodies this signifier. If the signifier appears as a morphological variant or synonym in the new input, extract the variant as it appears now.\n"
+            "4. Identify the exact single signifier within <phrase_context> that embodies this signifier. If the signifier appears as a morphological variant or synonym in <phrase_context>, extract the variant as it appears now.\n"
             "5. Output format: The single signifier, capitalized, followed by a question mark. (e.g., 'Liberated?'). Do not include quotes or any other text.\n\n"
             "NEW user input:\n"
         )
@@ -1189,11 +1297,7 @@ class ActionAnalyzeMessage(Action):
             # Clean the output to ensure it is a single word while preserving unicode materiality
             line = re.sub(r"[^\w\s-]", "", line, flags=re.UNICODE).strip()
             if line:
-                words = line.split()
-                if words:
-                    # Isolate the final word if the model hallucinates a phrase despite instructions
-                    final_word = words[-1].capitalize()
-                    return final_word + "?"
+                return line[0].upper() + line[1:] + "?"
             return "..."
         except Exception:
             return "..."
