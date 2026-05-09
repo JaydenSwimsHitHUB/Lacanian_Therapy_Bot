@@ -488,11 +488,26 @@ class ActionAnalyzeMessage(Action):
         self.shutdown_timer.daemon = True 
         self.shutdown_timer.start()
 
-    def _update_mechanism_counts(self, tracker: Tracker, mechanism: str) -> Tuple[Dict[str, int], int]:
+    def _update_mechanism_counts(self, tracker: Tracker, mechanism: str, detected_s1: Optional[str] = None) -> Tuple[Dict[str, int], int]:
         counts = tracker.get_slot("mechanism_counts") or {}
         last = tracker.get_slot("last_mechanism")
+        
+        # Reset counts if the mechanism category changes
         if mechanism != last:
             counts = {}
+            
+        # Contextual check for Master Signifier continuity
+        if mechanism == "master_signifier":
+            last_s1 = counts.get("__last_s1__")
+            current_s1 = detected_s1.strip().lower() if detected_s1 else ""
+            
+            # If the S1 has mutated, reset the count to prevent unwarranted escalation
+            if last_s1 is not None and current_s1 != last_s1:
+                counts[mechanism] = 0
+                
+            # Cache the current signifier for the subsequent turn
+            counts["__last_s1__"] = current_s1
+
         cnt = int(counts.get(mechanism, 0)) + 1
         counts[mechanism] = cnt
         return counts, cnt
@@ -726,7 +741,7 @@ class ActionAnalyzeMessage(Action):
             ]
             
         if mech in ALLOWED_MECHANISMS:
-            counts, cnt = self._update_mechanism_counts(tracker, mech)
+            counts, cnt = self._update_mechanism_counts(tracker, mech, detected_s1)
             dream_asked = tracker.get_slot("dream_fantasy_asked") or False
             
             text, newly_asked = await self.handle_mechanism(
@@ -838,6 +853,18 @@ class ActionAnalyzeMessage(Action):
         responses = response_matrix.get(mechanism, {})
         intervention = responses.get(count)
 
+        # Dynamic Intervention Override: Master Signifier Resonance
+        if mechanism == "master_signifier" and detected_s1:
+            bot_has_uttered_s1 = any(
+                detected_s1.lower() in line.lower()
+                for line in raw_history.splitlines()
+                if line.startswith("Bot:")
+            )
+            # Escalate to triple echo if the signifier has already been returned to the subject,
+            # unless the subject is holding the signifier in a secondary consecutive iteration (count == 2).
+            if bot_has_uttered_s1 and count != 2:
+                intervention = "<S1_triple_echo>"
+
         if mechanism == "negation" and (count == 1 or count == 3 or count == 5):
             return await self._gpt_denial_intervention(user_input, raw_history, prior_history, master_signifier_history), False
         if intervention == "<gpt_metonymy>":
@@ -901,10 +928,13 @@ class ActionAnalyzeMessage(Action):
             "You are a Lacanian analyst. The user is exhibiting METONYMY: an endless sliding of desire from signifier to signifier.\n"
             "Your task is to produce a 'Point de Capiton' (Quilting Point). You must STOP the slide by isolating a signifier that best matches the criteria below.\n\n"
             "Criteria for selection:\n"
-            "1. PRETERITION: A signifier that the user seems to skip over, gloss over, or treat as insignificant, but that appears repeatedly across the history.\n"
+            "1. PRETERITION: A signifier that the user seems to skip over, gloss over, or treat as insignificant, but that appears repeatedly across the session history.\n"
             "2. RUPTURE: A signifier involved in a parapraxis (slip of the tongue), a sudden grammatical failure, a mixed metaphor, or a jarring non-sequitur.\n"
             "3. INSISTENCE: A signifier that the user repeats unnecessarily, or that links back to their Master Signifier history.\n"
             "4. POLYSEMY: A signifier harboring high ambiguity, or multiple literal/figurative definitions when echoed back in isolation.\n\n"
+            "NOTES:\n"
+            "Bias towards selecting a signifer that appears in the user's <current_input>.\n"
+            "Always read the session history and check if you have asked about this signifier before. If you have, look for another one.\n\n"
             "Rule:\n"
             "Output ONLY valid JSON in the following strict format:\n"
             "{\n"
@@ -948,7 +978,7 @@ class ActionAnalyzeMessage(Action):
             else:
                 scenario_1_templates = [
                     "You mentioned '{signifier}' earlier. What comes to mind when you hear that?",
-                    "Earlier you said '{signifier}'. What do you associate with that?",
+                    "Earlier you said '{signifier}'. What do you associate with that now?",
                     "I am returning to '{signifier}'. What comes up for you?",
                     "You brought up '{signifier}' before. What does that bring to mind?",
                     "Let us go back to '{signifier}'. What are your thoughts on it now?",
@@ -974,11 +1004,11 @@ class ActionAnalyzeMessage(Action):
                     "Does '{signifier}' connect to anything else?"
                 ]
                 
-                # Scan the current session history to determine if ANY Scenario 1 prompt 
-                # featuring this exact signifier has already been emitted by the bot.
+                # Scan the current session history to determine if the bot has already returned this signifier
                 already_used = any(
-                    f"Bot: {template.format(signifier=signifier)}" in raw_history 
-                    for template in scenario_1_templates
+                    signifier.lower() in line.lower()
+                    for line in raw_history.splitlines()
+                    if line.startswith("Bot:")
                 )
                 
                 if already_used:
@@ -1341,13 +1371,14 @@ class ActionAnalyzeMessage(Action):
             return "What comes to mind when you say that?"
             
         system_msg = (
-            "You are a Lacanian analyst. The user is describing a dream. "
+            "You are a Lacanian analyst. The user is describing a dream or referencing one they talked about previously. "
             "In Lacanian analysis, dreams are read like a text (a rebus). DO NOT interpret the 'meaning' of the dream. "
             "Rules:\n"
             "1. Isolate the most jarring, absurd, homophonic, or repetitive signifier used in the dream report that the user glosses over and seems to view as insignificant.\n"
             "2. Produce exactly ONE short question asking the user to associate to THAT specific signifier.\n"
-            "3. Maximum 12 words.\n"
-            "Examples: 'What comes to mind when you say \"yellow dog\"?', 'Free associate on \"staircase\"?', 'Tell me more about the word \"drowning\".'"
+            "3. Always read the session history to check whether they are referencing a dream YOU ALREADY ASKED ABOUT in a previous intervention. If they are, find the next most bizarre or overlooked signifier in the USER TEXT that you have not yet asked about and ask about that one.\n"
+            "4. Maximum 12 words.\n"
+            "Examples: 'What comes to mind when you hear \"yellow dog\"?', 'What do you associate with \"staircase\"?', 'Tell me more about the word \"drowning\".'"
         )
         
         user_msg = _apply_prior_history_limit(
@@ -1361,7 +1392,7 @@ class ActionAnalyzeMessage(Action):
                 model=MODEL_NAME_FAST,
                 messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
                 max_tokens=20,
-                temperature=0.2,
+                temperature=0.4,
             )
             return resp.choices[0].message.content.strip().strip("\"'")
         except Exception:
