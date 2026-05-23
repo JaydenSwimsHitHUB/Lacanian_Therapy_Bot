@@ -9,6 +9,8 @@ nlu:
 - intent: user_message
   examples: |
     - Hi there.
+    - ok
+    - S
     - How are you?
     - Hello!
     - I was walking down the road when I saw a cow.

@@ -4,7 +4,7 @@ import re
 import random
 import sqlite3
 import asyncio
-import threading  # For the synchronous timer
+import threading
 import datetime
 from typing import Any, Text, Dict, List, Optional, Tuple
 
@@ -77,48 +77,32 @@ def get_master_signifier_history(db_path: str, user_id: str, limit: int = 100) -
         cursor = conn.execute(query, (user_id, limit))
         return [row[0] for row in cursor.fetchall()]
 
-def clear_user_master_signifiers_before(db_path: str, user_id: str, timestamp: str) -> None:
+def clear_user_master_signifiers_before(db_path: str, user_id: str, timestamp: str) -> int:
     with sqlite3.connect(db_path, timeout=10.0) as conn:
         conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("DELETE FROM master_signifiers WHERE user_id = ? AND timestamp < ?", (user_id, timestamp))
+        cursor = conn.execute("DELETE FROM master_signifiers WHERE user_id = ? AND timestamp <= ?", (user_id, timestamp))
+        deleted_count = cursor.rowcount
         conn.commit()
+        return deleted_count
 
-def _insert_master_signifiers_batch(db_path: str, user_id: str, s1_list: List[Dict[str, Any]]) -> None:
+def _insert_master_signifiers(db_path: str, user_id: str, s1_list: list) -> None:
+    if isinstance(s1_list, dict):
+        s1_list = [s1_list]
+
     with sqlite3.connect(db_path, timeout=10.0) as conn:
         conn.execute("PRAGMA journal_mode=WAL")
+        
+        query = "INSERT OR IGNORE INTO master_signifiers (user_id, signifier, phrase) VALUES (?, ?, ?)"
+        
+        valid_items = []
         for item in s1_list:
-            if not isinstance(item, dict):
-                continue
-            sig = item.get("signifier")
-            if not sig or not isinstance(sig, str):
-                continue
-            sig_clean = sig.strip()
-            phrase = item.get("phrase", "").strip()
-            if not sig_clean:
-                continue
-            cursor = conn.execute(
-                "SELECT 1 FROM master_signifiers WHERE user_id = ? AND signifier = ? COLLATE NOCASE LIMIT 1",
-                (user_id, sig_clean)
-            )
-            if cursor.fetchone() is None:
-                conn.execute(
-                    "INSERT INTO master_signifiers (user_id, signifier, phrase) VALUES (?, ?, ?)",
-                    (user_id, sig_clean, phrase)
-                )
-        conn.commit()
-
-def _insert_master_signifier(db_path: str, user_id: str, signifier: str, phrase: str) -> None:
-    with sqlite3.connect(db_path, timeout=10.0) as conn:
-        conn.execute("PRAGMA journal_mode=WAL")
-        cursor = conn.execute(
-            "SELECT 1 FROM master_signifiers WHERE user_id = ? AND signifier = ? COLLATE NOCASE LIMIT 1",
-            (user_id, signifier)
-        )
-        if cursor.fetchone() is None:
-            conn.execute(
-                "INSERT INTO master_signifiers (user_id, signifier, phrase) VALUES (?, ?, ?)",
-                (user_id, signifier, phrase)
-            )
+            if isinstance(item, dict) and isinstance(item.get("signifier"), str):
+                clean_sig = item["signifier"].strip()
+                if clean_sig:
+                    valid_items.append((user_id, clean_sig, item.get("phrase", "").strip()))
+                    
+        if valid_items:
+            conn.executemany(query, valid_items)
             conn.commit()
 
 # --- UTILITY: ROBUST JSON EXTRACTION ---
@@ -194,14 +178,23 @@ CUT_TRIGGERS = [
 
 # ---------- Utility for prompts ----------
 
-def _get_session_history_text(tracker: Tracker) -> str:
-    session_events: List[Dict[Text, Any]] = []
+def _extract_session_context(tracker: Tracker) -> Tuple[int, str, Optional[str]]:
+    """Single pass extraction of turn count, text log, and last bot message to remove redundancy."""
+    session_events = []
+    user_turn_count = 0
+    last_bot_text = None
+    
     for event in reversed(tracker.events):
         if event.get("event") == "session_started":
             break
         session_events.append(event)
+    
     session_events.reverse()
-
+    
+    for ev in session_events:
+        if ev.get("event") == "user" and ev.get("text"):
+            user_turn_count += 1
+            
     latest_text = (tracker.latest_message.get("text") or "").strip()
     
     if latest_text and session_events:
@@ -210,20 +203,23 @@ def _get_session_history_text(tracker: Tracker) -> str:
                 if session_events[i].get("text", "").strip() == latest_text:
                     session_events.pop(i)
                 break
-
-    lines: List[str] = []
+                
+    lines = []
     for ev in session_events:
         evt = ev.get("event")
+        text = (ev.get("text") or "").strip()
+        if not text:
+            continue
+            
         if evt == "user":
-            text = ev.get("text", "")
-            if text:
-                lines.append(f"User: {text}")
+            lines.append(f"User: {text}")
         elif evt == "bot":
-            text = ev.get("text", "")
-            if text:
-                lines.append(f"Bot: {text}")
+            lines.append(f"Bot: {text}")
+            last_bot_text = text
+            
+    raw_history_text = "\n".join(lines) if lines else "(no prior conversation in this session)"
     
-    return "\n".join(lines) if lines else "(no prior conversation in this session)"
+    return user_turn_count, raw_history_text, last_bot_text
 
 def _truncate_text_keep_end(text: str, max_chars: int) -> str:
     if not text:
@@ -249,15 +245,6 @@ def _apply_prior_history_limit(template: str, prior_history: str, total_limit: i
         return before + after
     truncated = _truncate_text_keep_end(prior_history or "", remaining)
     return before + truncated + after
-
-def _get_session_user_turn_count(tracker: Tracker) -> int:
-    count = 0
-    for event in reversed(tracker.events): 
-        if event.get("event") == "session_started":
-            break
-        if event.get("event") == "user" and event.get("text"):
-            count += 1
-    return count
 
 def build_cut_detection_prompt(
     new_input: str,
@@ -350,7 +337,7 @@ Respond ONLY in this strict JSON format:
 # ---------- Actions ----------
 class ActionSessionStartCustom(Action):
     def name(self) -> Text:
-        return "action_session_start_custom"
+        return "action_session_start"
 
     async def run(
         self,
@@ -361,8 +348,8 @@ class ActionSessionStartCustom(Action):
         
         user_id = tracker.sender_id
         
-        # Initiate asynchronous background extraction and replacement of S1s
-        asyncio.create_task(self._extract_and_replace_s1s(user_id))
+        # Await the purge directly so it completes before the next action fires
+        await self._extract_and_replace_s1s(user_id)
 
         return [
             SessionStarted(),
@@ -373,7 +360,7 @@ class ActionSessionStartCustom(Action):
             SlotSet("dream_fantasy_asked", False),
             ActionExecuted("action_listen"),
         ]
-
+    
     async def _extract_and_replace_s1s(self, user_id: str) -> None:
         """
         Background worker that processes the entire history at session start.
@@ -395,13 +382,15 @@ class ActionSessionStartCustom(Action):
             
             system_msg = (
                 "You are a Lacanian analyst. Your task is to review the patient's long-term history "
-                "and identify their 'Master Signifiers' (S1s). "
+                "and identify their 'Master Signifiers' (S1s).\n\n"
                 "An S1 is a signifier that repeats across history, often with low probability given what was uttered immediately before, "
-                "and is thus ostensibly a fundamental authoritative, absolute fact that stabilizes the subject's identity or discourse. "
-                "It is a 'just because' signifier that covers over the limits of meaning and language. "
-                "It may return in disguised forms, such as in synonyms, homophones, homonyms, metaphors or words-within-words\n\n"
-                "Extract a list of MAXIMUM 20 of the most significant S1s based on the entire history provided.\n\n"
-                "Be strict and only return signifiers that clearly match the criteria for Master Signifiers.\n\n"
+                "and is thus ostensibly a fundamental authoritative, absolute fact that stabilizes the subject's identity or discourse.\n"
+                "It is a 'just because' signifier that covers over the limits of meaning and language.\n"
+                "S1s may manifest in disguised forms, such as in synonyms, homophones, homonyms, metaphors or words-within-words.\n\n"
+                "CRITICAL INSTRUCTIONS:\n"
+                "1. STRICT CAP: Extract a MAXIMUM of 20 of the most significant S1s. Do not exceed this number.\n"
+                "2. DEDUPLICATION: You MUST group synonyms, morphological variants, and closely related concepts (e.g., 'mother', 'mom', 'maternal') under ONE single, strongest representative signifier. DO NOT output repeats.\n"
+                "3. EXCLUSIVITY: Every signifier in your final list must be structurally and semantically distinct from the others.\n\n"
                 "Output ONLY valid JSON in the following strict format:\n"
                 "{\n"
                 "  \"new_s1s\": [\n"
@@ -437,9 +426,9 @@ class ActionSessionStartCustom(Action):
                 await asyncio.to_thread(clear_user_master_signifiers_before, DB_PATH, user_id, session_start_time)
                 
                 # Batch insert avoiding the N+1 thread generation problem
-                await asyncio.to_thread(_insert_master_signifiers_batch, DB_PATH, user_id, new_s1s[:20])
+                await asyncio.to_thread(_insert_master_signifiers, DB_PATH, user_id, new_s1s[:20])
         except Exception as e:
-            print(f"Error extracting and replacing S1s on session start: {e}", flush=True)
+            pass
 
 class ActionAnalyzeMessage(Action):
     def __init__(self):
@@ -448,22 +437,13 @@ class ActionAnalyzeMessage(Action):
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute(
                 """
-                CREATE TABLE IF NOT EXISTS user_messages (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id TEXT NOT NULL,
-                    message TEXT NOT NULL,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-                )
-                """
-            )
-            conn.execute(
-                """
                 CREATE TABLE IF NOT EXISTS master_signifiers (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id TEXT NOT NULL,
-                    signifier TEXT NOT NULL,
+                    signifier TEXT NOT NULL COLLATE NOCASE,
                     phrase TEXT,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(user_id, signifier)
                 )
                 """
             )
@@ -511,13 +491,6 @@ class ActionAnalyzeMessage(Action):
         cnt = int(counts.get(mechanism, 0)) + 1
         counts[mechanism] = cnt
         return counts, cnt
-    
-    def _get_last_bot_message(self, tracker: Tracker) -> Optional[str]:
-        """Iterates backward through the tracker to isolate the immediate preceding bot utterance."""
-        for event in reversed(tracker.events):
-            if event.get("event") == "bot" and event.get("text"):
-                return event.get("text").strip()
-        return None
 
     async def _call_mech_api(self, mech_prompt: str) -> Dict[str, Any]:
         if not async_client:
@@ -555,27 +528,6 @@ class ActionAnalyzeMessage(Action):
             return data1, data2
         except Exception:
             return {}, {}
-
-    async def _fallback_responses_async(self, mech_prompt: str, scansion_prompt: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        if not async_client:
-            return {}, {}
-        try:
-            data1, data2 = await asyncio.gather(
-                async_client.chat.completions.create(
-                    model=MODEL_NAME_FAST,
-                    messages=[{"role": "user", "content": mech_prompt}],
-                    temperature=0.1,
-                ),
-                async_client.chat.completions.create(
-                    model=MODEL_NAME_FAST,
-                    messages=[{"role": "user", "content": scansion_prompt}],
-                    temperature=0.1,
-                    max_tokens=600,
-                )
-            )
-            return _extract_json(data1.choices[0].message.content.strip()), _extract_json(data2.choices[0].message.content.strip())
-        except Exception:
-            return {}, {}
     
     async def _cut_construction_async(self, prompt2b: str) -> Optional[str]:
         if not async_client:
@@ -601,9 +553,8 @@ class ActionAnalyzeMessage(Action):
         user_id = tracker.sender_id
         user_input = (tracker.latest_message.get("text", "") if tracker.latest_message else "").strip()
         
-        user_turn_count = _get_session_user_turn_count(tracker)
-        raw_history_text = _get_session_history_text(tracker)
-        last_bot_text = self._get_last_bot_message(tracker)
+        # Cleaned flow logic: extracting all context in one pass
+        user_turn_count, raw_history_text, last_bot_text = _extract_session_context(tracker)
 
         prior_history_messages, master_signifiers = await asyncio.gather(
             asyncio.to_thread(get_prior_history_messages, DB_PATH, user_id, 800),
@@ -616,8 +567,8 @@ class ActionAnalyzeMessage(Action):
             async def _safe_insert():
                 try:
                     await asyncio.to_thread(insert_user_message, DB_PATH, user_id, user_input)
-                except Exception as e:
-                    print(f"Database insertion error: {e}", flush=True)
+                except Exception:
+                    pass
             asyncio.create_task(_safe_insert())
         
         if user_turn_count <= 3:
@@ -657,7 +608,7 @@ class ActionAnalyzeMessage(Action):
             "- frame_protection: Demands for the session to end.\n"
             "- stasis: The user is stuck, stops associating, expresses an inability to continue, or responds with silence (...) or gibberish.\n"
             "- unfinished_thought: The user expresses an idea that is incomplete, trailing off, or self-interrupted.\n"
-            "- transference_lure: The user focuses on you (the analyst), makes demands of you, projects feelings onto you, or attempts to draw you into an imaginary, interpersonal dynamic.\n"
+            "- transference_lure: The user focuses on you (the analyst), makes demands of you, projects feelings onto you, or attempts to draw you into an Imaginary interpersonal dynamic.\n"
             "- parapraxis: A slip of the tongue, a spoonerism, a misreading, an utterence that the user 'did not mean to say' or any such error that reveals an unconscious signifier. Include instances where a signifier feels 'out of place' or originates from a distant embedding space.\n\n"
             "Master Signifier (S1) History (previously identified S1s for this user):\n"
             f"{master_signifier_history}\n\n"
@@ -678,19 +629,12 @@ class ActionAnalyzeMessage(Action):
             "Only output exactly one valid JSON object."
         )
         mech_prompt = _apply_prior_history_limit(mech_template, prior_history, TOTAL_PROMPT_CHAR_LIMIT)
-        
+
         # ==== PASS 1 & 2a: PARALLEL CALLS FOR SPEED ===#
         prompt2a = build_cut_detection_prompt(user_input, raw_history_text, prior_history, master_signifier_history)
         data1, data2 = await self._get_responses_parallel_async(mech_prompt, prompt2a)
-        
-        if not data1 and not data2:
-            data1, data2 = await self._fallback_responses_async(mech_prompt, prompt2a)
 
         mech: Optional[str] = data1.get("mechanism")
-        
-        if mech:
-            print(f"Selected Mechanism: {mech}", flush=True)
-
         mech_phrase: Optional[str] = data1.get("mechanism_phrase")
         detected_s1: Optional[str] = data1.get("master_signifier")
         
@@ -705,9 +649,9 @@ class ActionAnalyzeMessage(Action):
             s1_clean = detected_s1.strip()
             async def _safe_s1_insert():
                 try:
-                    await asyncio.to_thread(_insert_master_signifier, DB_PATH, user_id, s1_clean, mech_phrase or "")
-                except Exception as e:
-                    print(f"S1 database insertion error: {e}", flush=True)
+                    await asyncio.to_thread(_insert_master_signifiers, DB_PATH, user_id, {"signifier": s1_clean, "phrase": mech_phrase or ""})
+                except Exception:
+                    pass
             asyncio.create_task(_safe_s1_insert())
 
         # ==== PASS 2: Potential Cut Trigger Identification ===#
@@ -821,11 +765,10 @@ class ActionAnalyzeMessage(Action):
                 model=MODEL_NAME_FAST,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.8,
-                max_tokens=100  # Expanded buffer to prevent hard truncation
+                max_tokens=100
             )
             response_text = resp.choices[0].message.content.strip().replace('\n', ' ')
             
-            # Post-processing: Isolate the first complete sentence structure.
             if not re.search(r'[.!?]$', response_text):
                 match = re.search(r'^(.*?[.!?])', response_text)
                 if match:
@@ -853,15 +796,12 @@ class ActionAnalyzeMessage(Action):
         responses = response_matrix.get(mechanism, {})
         intervention = responses.get(count)
 
-        # Dynamic Intervention Override: Master Signifier Resonance
         if mechanism == "master_signifier" and detected_s1:
             bot_has_uttered_s1 = any(
                 detected_s1.lower() in line.lower()
                 for line in raw_history.splitlines()
                 if line.startswith("Bot:")
             )
-            # Escalate to triple echo if the signifier has already been returned to the subject,
-            # unless the subject is holding the signifier in a secondary consecutive iteration (count == 2).
             if bot_has_uttered_s1 and count != 2:
                 intervention = "<S1_triple_echo>"
 
@@ -972,7 +912,6 @@ class ActionAnalyzeMessage(Action):
             if not signifier:
                 return "..."
             
-            # Deterministic conditional routing in Python
             if signifier.lower() in user_input.lower():
                 return f"{signifier.capitalize()}?"
             else:
@@ -1004,7 +943,6 @@ class ActionAnalyzeMessage(Action):
                     "Does '{signifier}' connect to anything else?"
                 ]
                 
-                # Scan the current session history to determine if the bot has already returned this signifier
                 already_used = any(
                     signifier.lower() in line.lower()
                     for line in raw_history.splitlines()
@@ -1074,7 +1012,7 @@ class ActionAnalyzeMessage(Action):
                     {"role": "user", "content": user_msg},
                 ],
                 max_tokens=20,
-                temperature=0.1, # Reduced temperature to enforce strict adherence to the provided phrase
+                temperature=0.1, 
             )
             line = resp.choices[0].message.content.strip()
             line = line.strip("\"'").strip()
@@ -1122,12 +1060,8 @@ class ActionAnalyzeMessage(Action):
             line = line.strip("\"'").strip()
 
             if line:
-                # Ensure standard sentence casing
                 line = line[0].upper() + line[1:]
-                
-                # Append the question mark if the LLM didn't provide one
                 if not line.endswith("?"):
-                    # Strip any existing terminal periods before adding the question mark
                     line = line.rstrip(".") + "?"
                     
             return line
@@ -1222,15 +1156,6 @@ class ActionAnalyzeMessage(Action):
         except Exception:
             return "..."
 
-    @staticmethod
-    def _format_citation(text: str) -> str:
-        if not text:
-            return "..."
-        text = text[0].upper() + text[1:]
-        if not text.endswith(('.', '!', '?', '…')):
-            text += '.'
-        return text
-
     async def _generate_oracular_equivoque(self, text: str, raw_history: str, prior_history: str = "") -> str:
         if not async_client:
             return "..."
@@ -1267,18 +1192,15 @@ class ActionAnalyzeMessage(Action):
                     {"role": "system", "content": system_msg},
                     {"role": "user", "content": user_prompt},
                 ],
-                temperature=0.5, # Elevated to permit less probable, more surreal syntactic structures
+                temperature=0.5, 
                 max_tokens=15,
             )
             line = response.choices[0].message.content.strip()
             
-            # Post-processing to enforce strict sentence case and terminal punctuation
             line = line.strip("\"'").strip()
             if line:
-                # Force the first character to uppercase and all subsequent characters to lowercase
                 line = line[0].upper() + line[1:].lower()
                 
-                # Strip trailing erroneous punctuation and append the terminal period
                 if not line.endswith("."):
                     line = re.sub(r'[?!,;]+$', '', line) + "."
                     
@@ -1320,11 +1242,10 @@ class ActionAnalyzeMessage(Action):
                 model=MODEL_NAME_FAST,
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=10,
-                temperature=0.1, # Minimized entropy for strict extraction
+                temperature=0.1, 
             )
             line = resp.choices[0].message.content.strip()
             
-            # Clean the output to ensure it is a single word while preserving unicode materiality
             line = re.sub(r"[^\w\s-]", "", line, flags=re.UNICODE).strip()
             if line:
                 return line[0].upper() + line[1:] + "?"
@@ -1333,7 +1254,6 @@ class ActionAnalyzeMessage(Action):
             return "..."
         
     async def _gpt_real_question_intervention(self, text: str, raw_history: str, prior_history: str) -> str:
-        """Targets the Jouissance: Investigates the origins, timelines, and associations of a highly charged fantasy, symptom, or repetition compulsion."""
         if not async_client:
             return "What do you associate with this fantasy?"
             
@@ -1366,7 +1286,6 @@ class ActionAnalyzeMessage(Action):
             return "What do you associate with this fantasy?"
 
     async def _gpt_dream_intervention(self, text: str, raw_history: str, prior_history: str) -> str:
-        """Treats the dream as a text (rebus), isolating a bizarre signifier for association."""
         if not async_client:
             return "What comes to mind when you say that?"
             
@@ -1399,7 +1318,6 @@ class ActionAnalyzeMessage(Action):
             return "What comes to mind when you say that?"
 
     async def _gpt_desire_question_intervention(self, text: str, raw_history: str, prior_history: str) -> str:
-        """When the user is demanding advice, empathy, or knowledge (e.g., asking 'What should I do?'), question their desire for an answer rather than providing one."""
         if not async_client:
             return "What is your desire in this?"
             
@@ -1431,9 +1349,6 @@ class ActionAnalyzeMessage(Action):
             return "What is your desire in this?"
             
     async def _gpt_dream_fantasy_intervention(self) -> str:
-        """
-        Request a dream or fantasy to bypass the ego's resistance to work during stasis.
-        """
         prompts = [
             "Have you had any dreams, daydreams or fantasies lately, or in this session?",
             "What is a recurring fantasy of yours?",
@@ -1444,14 +1359,10 @@ class ActionAnalyzeMessage(Action):
             "Have you had any dreams or fantasies that seem to relate to what we've been discussing?",
             "Can you share a dream or fantasy that has been recurring for you?",
             "What is a dream or fantasy that you find yourself returning to in your thoughts?",
-    
         ]
         return random.choice(prompts)
     
     async def _gpt_minimalist_intervention(self, text: str, raw_history: str, prior_history: str) -> str:
-        """
-        Echo an unfinished thought verbatim to prompt further articulation without introducing external meaning.
-        """
         if not async_client:
             return "..."
             
@@ -1483,10 +1394,6 @@ class ActionAnalyzeMessage(Action):
             return "..."
         
     async def _gpt_parapraxis_intervention(self, mechanism_phrase: Optional[str]) -> str:
-        """
-        Isolates the literal slip from the provided phrase and echoes it.
-        Capitalization is applied to the full response, not the signifier itself.
-        """
         if not async_client or not mechanism_phrase:
             return "Well that's a slip!"
             
@@ -1529,8 +1436,6 @@ class ActionAnalyzeMessage(Action):
             
             response = random.choice(templates).format(slip=slip)
             
-            # Capitalize the final string if it starts with a letter, 
-            # otherwise return as-is (e.g., if it starts with a quote mark)
             if response and response[0].isalpha():
                 return response[0].upper() + response[1:]
             return response

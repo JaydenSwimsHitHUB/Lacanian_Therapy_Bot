@@ -15,7 +15,7 @@ responses:
 
 actions:
   - action_analyze_message
-  - action_session_start_custom
+  - action_session_start
 
 slots:
   session_thematic_count:
@@ -45,6 +45,13 @@ slots:
 
   mechanism_counts:
     type: any
+    influence_conversation: false
+    mappings:
+      - type: custom
+
+  dream_fantasy_asked:
+    type: bool
+    initial_value: false
     influence_conversation: false
     mappings:
       - type: custom
