@@ -4,8 +4,9 @@ import re
 import random
 import sqlite3
 import asyncio
-import threading
 import datetime
+import time
+from contextlib import contextmanager
 from typing import Any, Text, Dict, List, Optional, Tuple
 
 from openai import AsyncOpenAI
@@ -37,10 +38,17 @@ dir_path = os.path.dirname(DB_PATH)
 if dir_path:
     os.makedirs(dir_path, exist_ok=True)
 
-# Database functions
-def insert_user_message(db_path: str, user_id: str, message: str) -> None:
+# Database connection helper
+@contextmanager
+def _get_db_conn(db_path: str):
+    """Context manager for database connections with WAL mode."""
     with sqlite3.connect(db_path, timeout=10.0) as conn:
         conn.execute("PRAGMA journal_mode=WAL")
+        yield conn
+
+# Database functions
+def insert_user_message(db_path: str, user_id: str, message: str) -> None:
+    with _get_db_conn(db_path) as conn:
         conn.execute(
             "INSERT INTO user_messages (user_id, message) VALUES (?, ?)",
             (user_id, message),
@@ -48,8 +56,7 @@ def insert_user_message(db_path: str, user_id: str, message: str) -> None:
         conn.commit()
 
 def get_prior_history_messages(db_path: str, user_id: str, limit: int = 800) -> List[str]:
-    with sqlite3.connect(db_path, timeout=10.0) as conn:
-        conn.execute("PRAGMA journal_mode=WAL")
+    with _get_db_conn(db_path) as conn:
         query = """
             SELECT message FROM (
                 SELECT id, message, timestamp 
@@ -63,8 +70,7 @@ def get_prior_history_messages(db_path: str, user_id: str, limit: int = 800) -> 
         return [row[0] for row in cursor.fetchall()]
 
 def get_master_signifier_history(db_path: str, user_id: str, limit: int = 100) -> List[str]:
-    with sqlite3.connect(db_path, timeout=10.0) as conn:
-        conn.execute("PRAGMA journal_mode=WAL")
+    with _get_db_conn(db_path) as conn:
         query = """
             SELECT signifier FROM (
                 SELECT id, signifier, timestamp 
@@ -78,8 +84,7 @@ def get_master_signifier_history(db_path: str, user_id: str, limit: int = 100) -
         return [row[0] for row in cursor.fetchall()]
 
 def clear_user_master_signifiers_before(db_path: str, user_id: str, timestamp: str) -> int:
-    with sqlite3.connect(db_path, timeout=10.0) as conn:
-        conn.execute("PRAGMA journal_mode=WAL")
+    with _get_db_conn(db_path) as conn:
         cursor = conn.execute("DELETE FROM master_signifiers WHERE user_id = ? AND timestamp <= ?", (user_id, timestamp))
         deleted_count = cursor.rowcount
         conn.commit()
@@ -89,9 +94,7 @@ def _insert_master_signifiers(db_path: str, user_id: str, s1_list: list) -> None
     if isinstance(s1_list, dict):
         s1_list = [s1_list]
 
-    with sqlite3.connect(db_path, timeout=10.0) as conn:
-        conn.execute("PRAGMA journal_mode=WAL")
-        
+    with _get_db_conn(db_path) as conn:
         query = "INSERT OR IGNORE INTO master_signifiers (user_id, signifier, phrase) VALUES (?, ?, ?)"
         
         valid_items = []
@@ -104,6 +107,19 @@ def _insert_master_signifiers(db_path: str, user_id: str, s1_list: list) -> None
         if valid_items:
             conn.executemany(query, valid_items)
             conn.commit()
+
+# --- UTILITY HELPERS ---
+def _strip_response(text: str) -> str:
+    """Standardize response stripping: remove quotes and whitespace."""
+    return text.strip().strip("\"'").strip()
+
+def _ensure_trailing_punct(text: str, punct: str = "?") -> str:
+    """Ensure text ends with specified punctuation."""
+    if not text:
+        return text
+    if text.endswith(punct) or text.endswith("..."):
+        return text
+    return text.rstrip(" .") + punct
 
 # --- UTILITY: ROBUST JSON EXTRACTION ---
 def _extract_json(content: str) -> Dict[str, Any]:
@@ -346,11 +362,6 @@ class ActionSessionStartCustom(Action):
         domain: Dict[Text, Any],
     ) -> List[EventType]:
         
-        user_id = tracker.sender_id
-        
-        # Await the purge directly so it completes before the next action fires
-        await self._extract_and_replace_s1s(user_id)
-
         return [
             SessionStarted(),
             SlotSet("session_thematic_count", 0),
@@ -360,20 +371,61 @@ class ActionSessionStartCustom(Action):
             SlotSet("dream_fantasy_asked", False),
             ActionExecuted("action_listen"),
         ]
-    
+
+class ActionAnalyzeMessage(Action):
+    def __init__(self):
+        # --- PERSISTENCE ENABLED ---
+        with _get_db_conn(DB_PATH) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS master_signifiers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT NOT NULL,
+                    signifier TEXT NOT NULL COLLATE NOCASE,
+                    phrase TEXT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(user_id, signifier)
+                )
+                """
+            )
+            conn.commit()
+
+        # --- IDLE SHUTDOWN TIMER (SMART VERSION) ---
+        self.idle_task = None
+        self.idle_timeout = 1800.0  # 30 minutes in seconds
+
+    def name(self) -> Text:
+        return "action_analyze_message"
+
+    def _reset_timer(self, user_id: str):
+        # 1. Cancel the old timer if the user sends a new message
+        if self.idle_task:
+            self.idle_task.cancel()
+            
+        # 2. Create a new smart countdown
+        async def _countdown():
+            try:
+                await asyncio.sleep(self.idle_timeout)
+                print("User silent for 30 mins. Extracting S1s in the background...")
+                
+                # Do the heavy lifting while the user is away!
+                await self._extract_and_replace_s1s(user_id)
+                
+                print("Extraction complete. Shutting down server.")
+                os._exit(0)
+            except asyncio.CancelledError:
+                # If the user speaks before 30 mins, this safely resets
+                pass
+                
+        # 3. Start the countdown
+        self.idle_task = asyncio.create_task(_countdown())
+
     async def _extract_and_replace_s1s(self, user_id: str) -> None:
-        """
-        Background worker that processes the entire history at session start.
-        Extracts up to 20 master signifiers, purges the old database entries,
-        and inserts the newly generated list to enforce a strict cap.
-        """
         if not async_client:
             return
             
         try:
-            # Capture exact time prior to execution to avoid deleting concurrent live-session data
             session_start_time = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
-
             prior_history_messages = await asyncio.to_thread(get_prior_history_messages, DB_PATH, user_id, 800)
             if not prior_history_messages:
                 return
@@ -422,51 +474,10 @@ class ActionSessionStartCustom(Action):
             new_s1s = data.get("new_s1s")
             
             if isinstance(new_s1s, list):
-                # Target deletion strictly to S1s created before this job initiated
                 await asyncio.to_thread(clear_user_master_signifiers_before, DB_PATH, user_id, session_start_time)
-                
-                # Batch insert avoiding the N+1 thread generation problem
                 await asyncio.to_thread(_insert_master_signifiers, DB_PATH, user_id, new_s1s[:20])
         except Exception as e:
             pass
-
-class ActionAnalyzeMessage(Action):
-    def __init__(self):
-        # --- PERSISTENCE ENABLED ---
-        with sqlite3.connect(DB_PATH, timeout=10.0) as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS master_signifiers (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id TEXT NOT NULL,
-                    signifier TEXT NOT NULL COLLATE NOCASE,
-                    phrase TEXT,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(user_id, signifier)
-                )
-                """
-            )
-            conn.commit()
-
-        # --- IDLE SHUTDOWN TIMER (THREADING BASED) ---
-        self.shutdown_timer = None
-        self.idle_timeout = 1800.0  # 30 minutes in seconds
-        
-        self._reset_timer()
-
-    def name(self) -> Text:
-        return "action_analyze_message"
-
-    def _shutdown_server(self):
-        os._exit(0)
-
-    def _reset_timer(self):
-        if self.shutdown_timer:
-            self.shutdown_timer.cancel()
-        self.shutdown_timer = threading.Timer(self.idle_timeout, self._shutdown_server)
-        self.shutdown_timer.daemon = True 
-        self.shutdown_timer.start()
 
     def _update_mechanism_counts(self, tracker: Tracker, mechanism: str, detected_s1: Optional[str] = None) -> Tuple[Dict[str, int], int]:
         counts = tracker.get_slot("mechanism_counts") or {}
@@ -549,9 +560,15 @@ class ActionAnalyzeMessage(Action):
         tracker: Tracker,
         domain: Dict[Text, Any],
     ) -> List[EventType]:
-        self._reset_timer()
-        user_id = tracker.sender_id
         user_input = (tracker.latest_message.get("text", "") if tracker.latest_message else "").strip()
+    
+        # --- ADD THIS DEBUG LOG ---
+        current_time = time.strftime("%H:%M:%S")
+        print(f"[{current_time}] ACTION TRIGGERED. Input: '{user_input}'")
+        # --------------------------
+
+        user_id = tracker.sender_id
+        self._reset_timer(user_id)
         
         # Cleaned flow logic: extracting all context in one pass
         user_turn_count, raw_history_text, last_bot_text = _extract_session_context(tracker)
@@ -660,9 +677,8 @@ class ActionAnalyzeMessage(Action):
         potential_trigger_phrase: Optional[str] = None
         
         verified_trigger: Optional[str] = None
-        if potential_trigger and potential_trigger in CUT_TRIGGERS:
-            if user_turn_count >= 7:
-                verified_trigger = potential_trigger
+        if potential_trigger and user_turn_count >= 7:
+            verified_trigger = potential_trigger
                 
         # Only execute the construction API if the trigger is verified
         if verified_trigger and identified_s1:
@@ -1078,9 +1094,6 @@ class ActionAnalyzeMessage(Action):
             "Example: 'There's this... thing about her.' -> 'Thing?'"
         )
         user_msg = f"User text: \"{user_input}\""
-        return await self._gpt_ambiguity_intervention_async(system_msg, user_msg)
-    
-    async def _gpt_ambiguity_intervention_async(self, system_msg: str, user_msg: str) -> str:
         try:
             resp = await async_client.chat.completions.create(
                 model=MODEL_NAME_FAST,
@@ -1091,11 +1104,8 @@ class ActionAnalyzeMessage(Action):
                 max_tokens=15,
                 temperature=0.2,
             )
-            line = resp.choices[0].message.content.strip()
-            line = line.strip("\"'").strip()
-            if not line.endswith("?"):
-                line += "?"
-            return line
+            line = _strip_response(resp.choices[0].message.content)
+            return _ensure_trailing_punct(line, "?")
         except Exception:
             return "?"
 
@@ -1143,16 +1153,12 @@ class ActionAnalyzeMessage(Action):
                 max_tokens=32,
                 temperature=0.4,
             )
-            line = resp.choices[0].message.content.strip()
-            line = line.strip("\"'").strip()
-            line = line.splitlines()[0].strip()
+            line = _strip_response(resp.choices[0].message.content).splitlines()[0].strip()
             if not line:
                 return "..."
             if len(line) > 120:
-                return (line[:80].rstrip(" .") + "?")
-            if not (line.endswith("?") or line.endswith("...")):
-                line = line.rstrip(" .") + "?"
-            return line
+                line = line[:80].rstrip(" .")
+            return _ensure_trailing_punct(line, "?")
         except Exception:
             return "..."
 
@@ -1195,15 +1201,11 @@ class ActionAnalyzeMessage(Action):
                 temperature=0.5, 
                 max_tokens=15,
             )
-            line = response.choices[0].message.content.strip()
-            
-            line = line.strip("\"'").strip()
+            line = _strip_response(response.choices[0].message.content)
             if line:
                 line = line[0].upper() + line[1:].lower()
-                
                 if not line.endswith("."):
                     line = re.sub(r'[?!,;]+$', '', line) + "."
-                    
             return line
         except Exception:
             return "..."
@@ -1244,11 +1246,10 @@ class ActionAnalyzeMessage(Action):
                 max_tokens=10,
                 temperature=0.1, 
             )
-            line = resp.choices[0].message.content.strip()
-            
+            line = _strip_response(resp.choices[0].message.content)
             line = re.sub(r"[^\w\s-]", "", line, flags=re.UNICODE).strip()
             if line:
-                return line[0].upper() + line[1:] + "?"
+                return _ensure_trailing_punct(line[0].upper() + line[1:], "?")
             return "..."
         except Exception:
             return "..."
@@ -1371,7 +1372,7 @@ class ActionAnalyzeMessage(Action):
             "articulate an experience that they are reluctant to share.\n\n"
             "Isolate the single most unfinished thought from the user's text.\n"
             "Echo the last part of that thought followed by a question mark.\n\n"
-            "Example: If the user says 'I have been experiencing a lot of... nevermind it's not worth taking about', output 'A lot of?'\n"
+            "Example: If the user says 'I have been experiencing a lot of... nevermind it's not worth taking about', output 'A lot of...?'\n"
             "Example 2: If the user says 'I feel like I'm stuck in this... nah that's not important', output 'Stuck in this...?'\n"
             "Example 3: If the user says 'I'm not sure about this... it's complicated', output 'This...?'\n\n"    
         )
