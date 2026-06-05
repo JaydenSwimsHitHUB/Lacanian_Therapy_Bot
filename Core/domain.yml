@@ -15,7 +15,7 @@ responses:
 
 actions:
   - action_analyze_message
-  - action_session_start
+  - action_session_start_custom
 
 slots:
   session_thematic_count:

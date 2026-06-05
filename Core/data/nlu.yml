@@ -11,6 +11,40 @@ nlu:
     - Hi there.
     - ok
     - S
+    - Fine.
+    - Sure. 
+    - Duh.
+    - Huh?
+    - I. 
+    - A
+    - Wow. 
+    - You/
+    - coo+
+    - Minus-
+    - Gr)
+    - Y(
+    - )
+    - 9
+    - 10
+    - *
+    - &
+    - ^
+    - %
+    - $
+    - #
+    - @
+    - !
+    - `
+    - ~
+    - <
+    - >
+    - ?
+    - {
+    - \
+    - }
+    - [
+    - ]
+    - etc.
     - How are you?
     - Hello!
     - I was walking down the road when I saw a cow.
@@ -44,5 +78,3 @@ nlu:
     - buglerrr! 
     - Arghhh 
     - flflflfldujs
-    
-
