@@ -165,7 +165,7 @@ response_matrix: Dict[str, Dict[int, Optional[str]]] = {
     "contradiction": {1: "Hmm.",  2: "...", 3: "<oracle>", 4: "...", 5: "<gpt_metonymy>"},
     "repression": {1: "Ah?", 2: "...", 3: "<gpt_metonymy>", 4: "<oracle>"},
     "negation": {1: None, 2: "<oracle>"}, 
-    "jouissance": {1: "Oh?", 2: "<gpt_real_question>", 3: "<gpt_metonymy>", 4: "<gpt_real_question>", 5: "<gpt_metonymy>"},
+    "jouissance": {1: "Oh?", 2: "<gpt_real_question>", 3: "<gpt_metonymy>", 4: "<oracle>", 5: "<gpt_metonymy>"},
     "rationalization": {1: "And yet...", 2: "...", 3: "<oracle>"},
     "morality_logic_defense": {1: "...", 2: "And yet...", 3: "<oracle>"},
     "circular_logic": {1: "...", 2: "Hmm.", 3: "<oracle>"},
@@ -176,14 +176,14 @@ response_matrix: Dict[str, Dict[int, Optional[str]]] = {
     "fetishistic_phrase": {1: "...", 2: "<oracle>"},
     "identification_other_desire": {1: "<gpt_identification>", 2: "...", 3: "<oracle>", 5: "<gpt_metonymy>"}, 
     "demand_for_knowledge": {1: "...", 2: "Hmm.", 3: "<oracle>", 4: "<gpt_desire_question>", 5: "<gpt_metonymy>"},
-    "confession_empathy": {1: "...", 2: "Hmm.", 3: "...", 4: "<gpt_desire_question>", 5: "<oracle>"},
+    "confession_empathy": {1: "...", 2: "Hmm.", 3: "<oracle>", 4: "<gpt_desire_question>", 5: "<oracle>"},
     "frame_protection": {1: "...", 2: "Hmm.", 3: "<oracle>"},
     "dream_report": {1: "<gpt_dream_question>", 2: "<gpt_metonymy>", 3: "<oracle>"},
     "stasis": {1: "...", 2: "Hmm.", 3: "<gpt_dream_fantasy>", 4: "<oracle>"},
     "transference_lure": {1: "...", 2: "<gpt_metonymy>", 3: "<oracle>", 4: "<gpt_dream_fantasy>"},
     "transference_love": {1: "...", 2: "*Cough cough.*", 3: "<oracle>", 4: "<gpt_dream_fantasy>"},
     "unfinished_thought": {1: "<gpt_minimalist>", 2: "<gpt_minimalist>", 4: "<oracle>"},
-    "parapraxis": {1: "<gpt_parapraxis>", 2: "<gpt_parapraxis>"},
+    "parapraxis": {1: "<gpt_parapraxis>", 2: "<gpt_parapraxis>", 3: "<oracle>", 4: "<gpt_parapraxis>"},
 }
 
 ALLOWED_MECHANISMS = set(response_matrix.keys())
@@ -561,7 +561,12 @@ class ActionAnalyzeMessage(Action):
         domain: Dict[Text, Any],
     ) -> List[EventType]:
         user_input = (tracker.latest_message.get("text", "") if tracker.latest_message else "").strip()
-    
+        
+        # --- ADD THIS DEBUG LOG ---
+        current_time = time.strftime("%H:%M:%S")
+        print(f"[{current_time}] ACTION TRIGGERED. Input: '{user_input}'")
+        # --------------------------
+
         user_id = tracker.sender_id
         self._reset_timer(user_id)
         
@@ -1252,8 +1257,8 @@ class ActionAnalyzeMessage(Action):
             "You are a Lacanian analyst. The user is exhibiting Jouissance in a symptom, repetition compulsion, or highly charged fantasy. "
             "Your task is to ask a question that targets the origins, timelines, or associative links of this Jouissance. "
             "Rules:\n"
-            "1. Formulate ONE short, open-ended question using THEIR EXACT WORDS AS MUCH AS YOU CAN.\n"
-            "2. The question must ask about the origin (e.g., 'When did this fantasy start?', 'How old were you?') OR solicit free associations (e.g., 'What comes to mind when you think of [signifier]?', 'What do you associate with [signifier]?').\n"
+            "1. Formulate ONE short, open-ended question using THEIR EXACT SIGNIFIERS AS MUCH AS YOU CAN.\n"
+            "2. The question must ask about the origin (e.g., 'When did this fantasy concerning [signifier] start?', 'How old were you when you started to think about [signifier]?') OR solicit free associations (e.g., 'What comes to mind when you think of [signifier]?', 'What do you associate with [signifier]?').\n"
             "3. Use your intuition to determine whether an origin question or an associative question would be more appropriate based on the history, but you must always use the user's own language as much as possible.\n"
             "4. Scan the recent history to make sure you construct your question to sound natural and you aren't robotically repeating something you have asked before.\n"
             "5. Maximum 15 words.\n"
