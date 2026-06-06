@@ -562,11 +562,6 @@ class ActionAnalyzeMessage(Action):
     ) -> List[EventType]:
         user_input = (tracker.latest_message.get("text", "") if tracker.latest_message else "").strip()
     
-        # --- ADD THIS DEBUG LOG ---
-        current_time = time.strftime("%H:%M:%S")
-        print(f"[{current_time}] ACTION TRIGGERED. Input: '{user_input}'")
-        # --------------------------
-
         user_id = tracker.sender_id
         self._reset_timer(user_id)
         
@@ -824,7 +819,7 @@ class ActionAnalyzeMessage(Action):
         if mechanism == "negation" and (count == 1 or count == 3 or count == 5):
             return await self._gpt_denial_intervention(user_input, raw_history, prior_history, master_signifier_history), False
         if intervention == "<gpt_metonymy>":
-            return await self._gpt_metonymy_intervention(user_input, raw_history, prior_history, master_signifier_history), False
+            return await self._gpt_metonymy_intervention(user_input, raw_history), False
         if intervention == "<gpt_literalization>":
             return await self._gpt_literalization_intervention(user_input, phrase, raw_history, prior_history), False
         if intervention == "<gpt_identification>":
@@ -877,7 +872,7 @@ class ActionAnalyzeMessage(Action):
 
         return "...", False
 
-    async def _gpt_metonymy_intervention(self, user_input: str, raw_history: str, prior_history: str, master_signifier_history: str = "") -> str:
+    async def _gpt_metonymy_intervention(self, user_input: str, raw_history: str) -> str:
         if not async_client:
             return "..."
         system_msg = (
@@ -886,11 +881,11 @@ class ActionAnalyzeMessage(Action):
             "Criteria for selection:\n"
             "1. PRETERITION: A signifier that the user seems to skip over, gloss over, or treat as insignificant, but that appears repeatedly across the session history.\n"
             "2. RUPTURE: A signifier involved in a parapraxis (slip of the tongue), a sudden grammatical failure, a mixed metaphor, or a jarring non-sequitur.\n"
-            "3. INSISTENCE: A signifier that the user repeats unnecessarily, or that links back to their Master Signifier history.\n"
+            "3. INSISTENCE: A signifier that the user repeats unnecessarily throughout the current input or in this session.\n"
             "4. POLYSEMY: A signifier harboring high ambiguity, or multiple literal/figurative definitions when echoed back in isolation.\n\n"
             "NOTES:\n"
-            "Bias towards selecting a signifer that appears in the user's <current_input>.\n"
-            "Always read the session history and check if you have asked about this signifier before. If you have, look for another one.\n\n"
+            "Bias towards selecting a signifer from the user's current input.\n"
+            "If you have asked about this signifier before in the session, look for another one.\n\n"
             "Rule:\n"
             "Output ONLY valid JSON in the following strict format:\n"
             "{\n"
@@ -898,17 +893,12 @@ class ActionAnalyzeMessage(Action):
             "}"
         )
         user_msg_template = (
-            "Master Signifier (S1) History:\n"
-            f"{master_signifier_history}\n\n"
-            "Prior History:\n"
-            f"{PRIOR_HISTORY_TOKEN}\n\n"
-            "History:\n"
+            "Session History:\n"
             f"{raw_history}\n\n"
             f"Current Input: \"{user_input}\"\n\n"
             "Output the JSON Quilting Point:"
         )
-        user_msg_limit = TOTAL_PROMPT_CHAR_LIMIT - len(system_msg)
-        user_msg = _apply_prior_history_limit(user_msg_template, prior_history, user_msg_limit)
+        user_msg = user_msg_template
 
         try:
             resp = await async_client.chat.completions.create(
