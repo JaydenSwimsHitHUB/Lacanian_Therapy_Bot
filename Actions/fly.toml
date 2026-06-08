@@ -27,7 +27,7 @@ primary_region = "ams"
   auto_rollback = true
 
 [[vm]]
-  memory = "1gb"
+  memory = "2gb"
   cpu_kind = "shared"
   cpus = 1
 
