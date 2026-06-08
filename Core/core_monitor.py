@@ -36,8 +36,7 @@ def run_server():
         "--enable-api", 
         "--cors", "*", 
         "--port", "5005", 
-        "--interface", "0.0.0.0",
-        "--debug"  # Generates continuous internal activity markers
+        "--interface", "0.0.0.0"
     ]
     
     # Launch Rasa as a child process, capturing stdout and stderr combined
