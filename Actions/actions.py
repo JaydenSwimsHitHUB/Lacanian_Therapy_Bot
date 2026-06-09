@@ -9,10 +9,31 @@ import time
 from contextlib import contextmanager
 from typing import Any, Text, Dict, List, Optional, Tuple
 
+from cryptography.fernet import Fernet, InvalidToken
 from openai import AsyncOpenAI
 from rasa_sdk import Action, Tracker
 from rasa_sdk.executor import CollectingDispatcher
 from rasa_sdk.events import SlotSet, SessionStarted, ActionExecuted, EventType
+
+# --- SETUP ENCRYPTION ---
+# The key must be a URL-safe base64-encoded 32-byte key provided via Fly.io secrets
+ENCRYPTION_KEY = os.getenv("CHAT_ENCRYPTION_KEY")
+cipher_suite = Fernet(ENCRYPTION_KEY.encode('utf-8')) if ENCRYPTION_KEY else None
+
+def _encrypt(text: str) -> str:
+    """Encrypts plaintext to a Fernet token string."""
+    if not cipher_suite or not text:
+        return text
+    return cipher_suite.encrypt(text.encode('utf-8')).decode('utf-8')
+
+def _decrypt(text: str) -> str:
+    """Decrypts a Fernet token string back to plaintext. Falls back gracefully for legacy unencrypted data."""
+    if not cipher_suite or not text:
+        return text
+    try:
+        return cipher_suite.decrypt(text.encode('utf-8')).decode('utf-8')
+    except InvalidToken:
+        return text  # Handles old, unencrypted database rows
 
 # --- SETUP CLIENT FOR DOLPHIN LLAMA ---
 api_key = os.getenv("OPENAI_API_KEY")
@@ -48,10 +69,11 @@ def _get_db_conn(db_path: str):
 
 # Database functions
 def insert_user_message(db_path: str, user_id: str, message: str) -> None:
+    encrypted_message = _encrypt(message)
     with _get_db_conn(db_path) as conn:
         conn.execute(
             "INSERT INTO user_messages (user_id, message) VALUES (?, ?)",
-            (user_id, message),
+            (user_id, encrypted_message),
         )
         conn.commit()
 
@@ -67,7 +89,7 @@ def get_prior_history_messages(db_path: str, user_id: str, limit: int = 800) -> 
             ) ORDER BY timestamp ASC, id ASC
         """
         cursor = conn.execute(query, (user_id, limit))
-        return [row[0] for row in cursor.fetchall()]
+        return [_decrypt(row[0]) for row in cursor.fetchall()]
 
 def get_master_signifier_history(db_path: str, user_id: str, limit: int = 100) -> List[str]:
     with _get_db_conn(db_path) as conn:
@@ -81,7 +103,7 @@ def get_master_signifier_history(db_path: str, user_id: str, limit: int = 100) -
             ) ORDER BY timestamp ASC, id ASC
         """
         cursor = conn.execute(query, (user_id, limit))
-        return [row[0] for row in cursor.fetchall()]
+        return [_decrypt(row[0]) for row in cursor.fetchall()]
 
 def clear_user_master_signifiers_before(db_path: str, user_id: str, timestamp: str) -> int:
     with _get_db_conn(db_path) as conn:
@@ -95,14 +117,21 @@ def _insert_master_signifiers(db_path: str, user_id: str, s1_list: list) -> None
         s1_list = [s1_list]
 
     with _get_db_conn(db_path) as conn:
-        query = "INSERT OR IGNORE INTO master_signifiers (user_id, signifier, phrase) VALUES (?, ?, ?)"
+        query = "INSERT INTO master_signifiers (user_id, signifier, phrase) VALUES (?, ?, ?)"
         
         valid_items = []
+        seen_signifiers = set()
+        
         for item in s1_list:
             if isinstance(item, dict) and isinstance(item.get("signifier"), str):
                 clean_sig = item["signifier"].strip()
                 if clean_sig:
-                    valid_items.append((user_id, clean_sig, item.get("phrase", "").strip()))
+                    sig_lower = clean_sig.lower()
+                    if sig_lower not in seen_signifiers:
+                        seen_signifiers.add(sig_lower)
+                        enc_sig = _encrypt(clean_sig)
+                        enc_phrase = _encrypt(item.get("phrase", "").strip())
+                        valid_items.append((user_id, enc_sig, enc_phrase))
                     
         if valid_items:
             conn.executemany(query, valid_items)
@@ -381,10 +410,9 @@ class ActionAnalyzeMessage(Action):
                 CREATE TABLE IF NOT EXISTS master_signifiers (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id TEXT NOT NULL,
-                    signifier TEXT NOT NULL COLLATE NOCASE,
+                    signifier TEXT NOT NULL,
                     phrase TEXT,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(user_id, signifier)
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
                 """
             )
@@ -507,11 +535,14 @@ class ActionAnalyzeMessage(Action):
         if not async_client:
             return {}
         try:
+            api_start = time.time()
             resp = await async_client.chat.completions.create(
                 model=MODEL_NAME_FAST,
                 messages=[{"role": "user", "content": mech_prompt}],
                 temperature=0.1,
             )
+            api_time = time.time() - api_start
+            print(f"  [API: Mechanism Detection] {api_time:.3f}s")
             return _extract_json(resp.choices[0].message.content.strip())
         except Exception:
             return {}
@@ -520,12 +551,15 @@ class ActionAnalyzeMessage(Action):
         if not async_client:
             return {}
         try:
+            api_start = time.time()
             resp = await async_client.chat.completions.create(
                 model=MODEL_NAME_REASONING,
                 messages=[{"role": "user", "content": scansion_prompt}],
                 temperature=0.1,
                 max_tokens=600,
             )
+            api_time = time.time() - api_start
+            print(f"  [API: Scansion/Cut Detection] {api_time:.3f}s")
             return _extract_json(resp.choices[0].message.content.strip())
         except Exception:
             return {}
@@ -544,11 +578,14 @@ class ActionAnalyzeMessage(Action):
         if not async_client:
             return None
         try:
+            api_start = time.time()
             resp = await async_client.chat.completions.create(
                 model=MODEL_NAME_FAST,
                 messages=[{"role": "user", "content": prompt2b}],
                 temperature=0.1,
             )
+            api_time = time.time() - api_start
+            print(f"  [API: Cut Construction] {api_time:.3f}s")
             data2b = _extract_json(resp.choices[0].message.content.strip())
             return data2b.get("cut_phrase")
         except Exception:
@@ -560,23 +597,33 @@ class ActionAnalyzeMessage(Action):
         tracker: Tracker,
         domain: Dict[Text, Any],
     ) -> List[EventType]:
-        user_input = (tracker.latest_message.get("text", "") if tracker.latest_message else "").strip()
-        
-        # --- ADD THIS DEBUG LOG ---
+        # --- TIMING START ---
+        start_time = time.time()
         current_time = time.strftime("%H:%M:%S")
-        print(f"[{current_time}] ACTION TRIGGERED. Input: '{user_input}'")
-        # --------------------------
+        print(f"\n[{current_time}] ===== ACTION TRIGGERED =====")
+        # ----------------------------
+        
+        user_input = (tracker.latest_message.get("text", "") if tracker.latest_message else "").strip()
+        print(f"Input: '{user_input}'")
 
         user_id = tracker.sender_id
         self._reset_timer(user_id)
         
-        # Cleaned flow logic: extracting all context in one pass
+        # --- CONTEXT EXTRACTION ---
+        context_start = time.time()
         user_turn_count, raw_history_text, last_bot_text = _extract_session_context(tracker)
+        context_time = time.time() - context_start
+        print(f"[CONTEXT EXTRACTION] {context_time:.3f}s")
 
+        # --- DATABASE QUERIES ---
+        db_start = time.time()
         prior_history_messages, master_signifiers = await asyncio.gather(
             asyncio.to_thread(get_prior_history_messages, DB_PATH, user_id, 800),
             asyncio.to_thread(get_master_signifier_history, DB_PATH, user_id, 100)
         )
+        db_time = time.time() - db_start
+        print(f"[DATABASE QUERIES] {db_time:.3f}s (prior: {len(prior_history_messages)}, S1s: {len(master_signifiers)})")
+        
         prior_history = "\n".join(f"- {msg}" for msg in prior_history_messages)
         master_signifier_history = "\n".join(f"* {s}" for s in master_signifiers)
         
@@ -589,12 +636,18 @@ class ActionAnalyzeMessage(Action):
             asyncio.create_task(_safe_insert())
         
         if user_turn_count <= 3:
+            initial_start = time.time()
             initial_response = await self._generate_initial_therapeutic_response(user_input, raw_history_text, prior_history)
+            initial_time = time.time() - initial_start
+            print(f"[INITIAL RESPONSE] {initial_time:.3f}s")
             
             if initial_response == last_bot_text and initial_response != "...":
                 initial_response = "..."
                 
             dispatcher.utter_message(text=initial_response)
+            
+            total_time = time.time() - start_time
+            print(f"[TOTAL TIME] {total_time:.3f}s\n")
             return []
             
         low = user_input.lower()
@@ -648,8 +701,11 @@ class ActionAnalyzeMessage(Action):
         mech_prompt = _apply_prior_history_limit(mech_template, prior_history, TOTAL_PROMPT_CHAR_LIMIT)
 
         # ==== PASS 1 & 2a: PARALLEL CALLS FOR SPEED ===#
+        api_start = time.time()
         prompt2a = build_cut_detection_prompt(user_input, raw_history_text, prior_history, master_signifier_history)
         data1, data2 = await self._get_responses_parallel_async(mech_prompt, prompt2a)
+        api_time = time.time() - api_start
+        print(f"[MECHANISM + CUT DETECTION] {api_time:.3f}s")
 
         mech: Optional[str] = data1.get("mechanism")
         mech_phrase: Optional[str] = data1.get("mechanism_phrase")
@@ -682,8 +738,11 @@ class ActionAnalyzeMessage(Action):
                 
         # Only execute the construction API if the trigger is verified
         if verified_trigger and identified_s1:
+            cut_start = time.time()
             prompt2b = build_cut_construction_prompt(user_input, identified_s1)
             potential_trigger_phrase = await self._cut_construction_async(prompt2b)
+            cut_time = time.time() - cut_start
+            print(f"[CUT CONSTRUCTION] {cut_time:.3f}s")
             
         data2["cut_phrase"] = potential_trigger_phrase
         final_trigger_phrase = potential_trigger_phrase if verified_trigger else None
@@ -694,6 +753,8 @@ class ActionAnalyzeMessage(Action):
         if verified_trigger:
             say = final_trigger_phrase if final_trigger_phrase else "We are ending there."
             dispatcher.utter_message(text=say)
+            total_time = time.time() - start_time
+            print(f"[CUT TRIGGERED] Total time: {total_time:.3f}s\n")
             return [
                 SlotSet("cut_trigger", verified_trigger),
                 SlotSet("last_mechanism", None),
@@ -701,6 +762,7 @@ class ActionAnalyzeMessage(Action):
             ]
             
         if mech in ALLOWED_MECHANISMS:
+            response_start = time.time()
             counts, cnt = self._update_mechanism_counts(tracker, mech, detected_s1)
             dream_asked = tracker.get_slot("dream_fantasy_asked") or False
             
@@ -715,6 +777,8 @@ class ActionAnalyzeMessage(Action):
                 detected_s1=detected_s1,
                 dream_fantasy_asked=dream_asked
             )
+            response_time = time.time() - response_start
+            print(f"[MECHANISM RESPONSE: {mech}] {response_time:.3f}s")
             
             # --- Anti-Repetition Check ---
             if text == last_bot_text and text != "...":
@@ -734,10 +798,14 @@ class ActionAnalyzeMessage(Action):
             
             if newly_asked:
                 events.append(SlotSet("dream_fantasy_asked", True))
-                
+            
+            total_time = time.time() - start_time
+            print(f"[TOTAL TIME] {total_time:.3f}s\n")
             return events
             
         dispatcher.utter_message(text="...")
+        total_time = time.time() - start_time
+        print(f"[NO MECHANISM DETECTED] Total time: {total_time:.3f}s\n")
         return [
             SlotSet("last_mechanism", None),
             SlotSet("mechanism_counts", tracker.get_slot("mechanism_counts") or {}),
@@ -777,12 +845,16 @@ class ActionAnalyzeMessage(Action):
         if not async_client:
             return "..."
         try:
+            gen_start = time.time()
             resp = await async_client.chat.completions.create(
                 model=MODEL_NAME_FAST,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.8,
                 max_tokens=100
             )
+            gen_time = time.time() - gen_start
+            print(f"[API CALL - Initial Response] {gen_time:.3f}s")
+            
             response_text = resp.choices[0].message.content.strip().replace('\n', ' ')
             
             if not re.search(r'[.!?]$', response_text):
@@ -906,6 +978,7 @@ class ActionAnalyzeMessage(Action):
         user_msg = user_msg_template
 
         try:
+            api_start = time.time()
             resp = await async_client.chat.completions.create(
                 model=MODEL_NAME_FAST,
                 messages=[
@@ -915,6 +988,8 @@ class ActionAnalyzeMessage(Action):
                 temperature=0.2,
                 max_tokens=25, 
             )
+            api_time = time.time() - api_start
+            print(f"  [API: Metonymy] {api_time:.3f}s")
             
             content = resp.choices[0].message.content.strip()
             data = _extract_json(content)
@@ -1016,6 +1091,7 @@ class ActionAnalyzeMessage(Action):
         user_msg = _apply_prior_history_limit(user_msg_template, prior_history, user_msg_limit)
         
         try:
+            api_start = time.time()
             resp = await async_client.chat.completions.create(
                 model=MODEL_NAME_FAST,
                 messages=[
@@ -1025,6 +1101,9 @@ class ActionAnalyzeMessage(Action):
                 max_tokens=20,
                 temperature=0.1, 
             )
+            api_time = time.time() - api_start
+            print(f"  [API: Literalization] {api_time:.3f}s")
+            
             line = resp.choices[0].message.content.strip()
             line = line.strip("\"'").strip()
             if not line.endswith("?"):
@@ -1187,15 +1266,19 @@ class ActionAnalyzeMessage(Action):
         user_prompt = _apply_prior_history_limit(user_prompt_template, prior_history, user_prompt_limit)
 
         try:
+            api_start = time.time()
             response = await async_client.chat.completions.create(
                 model=MODEL_NAME_FAST,  
                 messages=[
                     {"role": "system", "content": system_msg},
                     {"role": "user", "content": user_prompt},
                 ],
-                temperature=0.5, 
+                temperature=0.8, 
                 max_tokens=15,
             )
+            api_time = time.time() - api_start
+            print(f"  [API: Oracle] {api_time:.3f}s")
+            
             line = _strip_response(response.choices[0].message.content)
             if line:
                 line = line[0].upper() + line[1:].lower()
