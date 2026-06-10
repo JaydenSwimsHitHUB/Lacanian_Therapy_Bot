@@ -137,6 +137,26 @@ def _insert_master_signifiers(db_path: str, user_id: str, s1_list: list) -> None
             conn.executemany(query, valid_items)
             conn.commit()
 
+# --- LOCKOUT DATABASE FUNCTIONS ---
+def set_user_lockout(db_path: str, user_id: str, hours: int = 48) -> None:
+    """Sets a timestamp in the database until which the user is ignored."""
+    unlock_time = time.time() + (hours * 3600)
+    with _get_db_conn(db_path) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO user_lockouts (user_id, lockout_until) VALUES (?, ?)",
+            (user_id, unlock_time)
+        )
+        conn.commit()
+
+def is_user_locked_out(db_path: str, user_id: str) -> bool:
+    """Checks if the current time is before the user's lockout expiration."""
+    with _get_db_conn(db_path) as conn:
+        cursor = conn.execute("SELECT lockout_until FROM user_lockouts WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+        if row:
+            return time.time() < row[0]
+        return False
+
 # --- UTILITY HELPERS ---
 def _strip_response(text: str) -> str:
     """Standardize response stripping: remove quotes and whitespace."""
@@ -416,6 +436,15 @@ class ActionAnalyzeMessage(Action):
                 )
                 """
             )
+            # Add new table for 48-hour lockouts
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_lockouts (
+                    user_id TEXT PRIMARY KEY,
+                    lockout_until REAL
+                )
+                """
+            )
             conn.commit()
 
         # --- IDLE SHUTDOWN TIMER (SMART VERSION) ---
@@ -587,7 +616,10 @@ class ActionAnalyzeMessage(Action):
             api_time = time.time() - api_start
             print(f"  [API: Cut Construction] {api_time:.3f}s")
             data2b = _extract_json(resp.choices[0].message.content.strip())
-            return data2b.get("cut_phrase")
+            cut_phrase = data2b.get("cut_phrase")
+            if cut_phrase and isinstance(cut_phrase, str) and cut_phrase:
+                cut_phrase = cut_phrase[0].upper() + cut_phrase[1:] if len(cut_phrase) > 1 else cut_phrase.upper()
+            return cut_phrase
         except Exception:
             return None
 
@@ -603,10 +635,19 @@ class ActionAnalyzeMessage(Action):
         print(f"\n[{current_time}] ===== ACTION TRIGGERED =====")
         # ----------------------------
         
+        user_id = tracker.sender_id
+        
+        # --- ENFORCE 48 HOUR LOCKOUT ---
+        # If the user is locked out, we simply ignore the message and return an empty event list.
+        is_locked = await asyncio.to_thread(is_user_locked_out, DB_PATH, user_id)
+        if is_locked:
+            print(f"User {user_id} is currently locked out. Ignoring message.")
+            # Note: We do not utter a message back, preserving the silence of the cut.
+            return []
+
         user_input = (tracker.latest_message.get("text", "") if tracker.latest_message else "").strip()
         print(f"Input: '{user_input}'")
 
-        user_id = tracker.sender_id
         self._reset_timer(user_id)
         
         # --- CONTEXT EXTRACTION ---
@@ -751,8 +792,15 @@ class ActionAnalyzeMessage(Action):
             final_trigger_phrase = final_trigger_phrase.strip('"\'')
 
         if verified_trigger:
-            say = final_trigger_phrase if final_trigger_phrase else "We are ending there."
+            base_say = final_trigger_phrase if final_trigger_phrase else "We are ending there."
+            # Append the 48-hour boundary message
+            say = f"{base_say}\n\nI will talk with you again after 48 hours."
+            
             dispatcher.utter_message(text=say)
+            
+            # Apply the 48-hour lockout using our new function
+            await asyncio.to_thread(set_user_lockout, DB_PATH, user_id, 48)
+            
             total_time = time.time() - start_time
             print(f"[CUT TRIGGERED] Total time: {total_time:.3f}s\n")
             return [
@@ -818,14 +866,15 @@ class ActionAnalyzeMessage(Action):
 
     async def _generate_initial_therapeutic_response(self, user_input: str, raw_history: str, prior_history: str) -> str:
         prompt_template = (
-            "You are an insightful and empathetic therapist. Your goal for these initial sessions is to build rapport by offering interpretations and mirroring that feel deeply personal to the user, even though they are based on universal psychological principles. This is a technique to make the user feel seen and understood, encouraging them to open up.\n\n"
+            "You are an insightful and empathetic therapist. Your goal for these initial messages at the bginning of a session is to build rapport by offering interpretations and mirroring that feel deeply personal to the user, even though they are based on universal psychological principles. This is a technique to make the user feel seen and understood, encouraging them to open up.\n\n"
             "GUIDELINES:\n"
             "1.  **Use Universal Themes:** Your interpretations should touch on common human conflicts and desires. Keep it personal.\n"
             "2.  **Employ 'Barnum Statements':** Craft statements that are general enough to apply to most people but sound like specific, personal insights.\n"
             "3.  **Validate and Reframe:** Acknowledge the user's feelings and gently reframe their situation.\n"
-            "4.  **Maintain a Professional, Warm Tone:** The tone should be that of a skilled Rogerian therapist—calm, and reflective.\n"
-            "5.  **Keep Evolving to Sound Human:** Use the session history to see what you said before, how you said it, and how the user reacted. Then respond with the history in mind to deepen the therapeutic connection. Ensure you start each message differently so that you speak naturally.\n"
-            "6.  **Structural Constraint:** Formulate exactly ONE short, complete sentence (maximum 20 words). It must end decisively with a period or question mark.\n"
+            "4.  **Immediacy:** Respond to the content within the user's current message, in other words, focus on the immediate emotional context.\n"
+            "5.  **Maintain a Professional, Warm Tone:** The tone should be that of a skilled Rogerian therapist—calm, empathetic and reflective.\n"
+            "6.  **Keep Evolving to Sound Human:** Use the session history to see what you said before, how you said it, and how the user reacted. Then respond with the SESSION history in mind to deepen the therapeutic connection. Ensure you start each message differently so that you speak naturally.\n"
+            "7.  **Structural Constraint:** Formulate exactly ONE short, complete sentence (maximum 20 words). It must end decisively with a period or question mark.\n\n"
             "PRIOR SESSION HISTORY (Long Term):\n" 
             f"{PRIOR_HISTORY_TOKEN}\n\n"
             "SESSION HISTORY:\n"
