@@ -27,13 +27,11 @@ class FastTelegramInput(TelegramInput):
             # 3. Calculate how long the message spent traveling through the internet
             network_transit_time = trigger_time - telegram_sent_time
             
-            # 4. Sound the alarm if it took longer than 5 seconds to reach our front door
+            # 4. Always log the network transit time, and sound the alarm if it took longer than 5 seconds
+            logger.warning(f"[TRACKER-{message_id}] 1. Webhook triggered. Network transit time: {network_transit_time:.2f}s")
             if network_transit_time > 5.0:
                 logger.warning(f"[ALARM] Network Bottleneck Detected! Message took {network_transit_time:.2f}s to reach us.")
             # --- END OF OUR ALARM SYSTEM ---
-            
-            # Log that the receptionist took the message
-            logger.warning(f"[TRACKER-{message_id}] 1. Webhook triggered. Transit time: {network_transit_time:.2f}s")
             
             async def safe_process():
                 try:
