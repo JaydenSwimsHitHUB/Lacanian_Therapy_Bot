@@ -32,5 +32,5 @@ primary_region = "ams"
   cpus = 1
 
 [mounts]
-  source = "chatdata"
+  source = "chat_history_v2"
   destination = "/app/persistent"
