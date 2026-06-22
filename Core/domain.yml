@@ -25,6 +25,12 @@ slots:
     mappings:
       - type: custom
 
+  session_start_time:
+    type: float
+    influence_conversation: false
+    mappings:
+      - type: custom
+
   last_mechanism:
     type: text
     influence_conversation: false

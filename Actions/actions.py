@@ -138,9 +138,18 @@ def _insert_master_signifiers(db_path: str, user_id: str, s1_list: list) -> None
             conn.commit()
 
 # --- LOCKOUT DATABASE FUNCTIONS ---
-def set_user_lockout(db_path: str, user_id: str, hours: int = 48) -> None:
-    """Sets a timestamp in the database until which the user is ignored."""
-    unlock_time = time.time() + (hours * 3600)
+def set_user_lockout(db_path: str, user_id: str, hours: int = 48, base_time: Optional[float] = None) -> None:
+    """Sets a timestamp in the database until which the user is ignored.
+    
+    Args:
+        db_path: Path to the database
+        user_id: User ID
+        hours: Number of hours to lock out
+        base_time: Base timestamp to calculate from. If None, uses current time.
+    """
+    if base_time is None:
+        base_time = time.time()
+    unlock_time = base_time + (hours * 3600)
     with _get_db_conn(db_path) as conn:
         conn.execute(
             "INSERT OR REPLACE INTO user_lockouts (user_id, lockout_until) VALUES (?, ?)",
@@ -418,6 +427,7 @@ class ActionSessionStartCustom(Action):
             SlotSet("mechanism_counts", None),
             SlotSet("cut_trigger", None),
             SlotSet("dream_fantasy_asked", False),
+            SlotSet("session_start_time", time.time()),
             ActionExecuted("action_listen"),
         ]
 
@@ -627,6 +637,25 @@ class ActionAnalyzeMessage(Action):
             # Note: We do not utter a message back, preserving the silence of the cut.
             return []
 
+        # --- ENFORCE 30 MINUTE SESSION LIMIT ---
+        # Check if the session has exceeded 30 minutes (1800 seconds) from the start
+        session_start_time = tracker.get_slot("session_start_time")
+        if session_start_time is not None:
+            current_time = time.time()
+            session_duration = current_time - session_start_time
+            if session_duration >= 1800:  # 30 minutes in seconds
+                # Send the session time limit message
+                session_end_message = (
+                    "Our session time is up, to push further would encourage over-analysis.\n\n"
+                    "I will talk with you again in 48 hours."
+                )
+                dispatcher.utter_message(text=session_end_message)
+                
+                # Apply the 48-hour lockout from the session start time
+                await asyncio.to_thread(set_user_lockout, DB_PATH, user_id, 48, session_start_time)
+                
+                return []
+
         user_input = (tracker.latest_message.get("text", "") if tracker.latest_message else "").strip()
 
         self._reset_timer(user_id)
@@ -761,8 +790,10 @@ class ActionAnalyzeMessage(Action):
             
             dispatcher.utter_message(text=say)
             
-            # Apply the 48-hour lockout using our new function
-            await asyncio.to_thread(set_user_lockout, DB_PATH, user_id, 48)
+            # --- MODIFIED: Retrieve session start time and apply it to the lockout ---
+            session_start_time = tracker.get_slot("session_start_time")
+            await asyncio.to_thread(set_user_lockout, DB_PATH, user_id, 48, session_start_time)
+            # -------------------------------------------------------------------------
             
             return [
                 SlotSet("cut_trigger", verified_trigger),
