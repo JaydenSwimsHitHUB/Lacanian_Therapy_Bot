@@ -530,7 +530,7 @@ class ActionAnalyzeMessage(Action):
                     {"role": "system", "content": system_msg},
                     {"role": "user", "content": user_msg}
                 ],
-                temperature=0.2,
+                temperature=0.1,
                 max_tokens=1500
             )
             
@@ -573,7 +573,7 @@ class ActionAnalyzeMessage(Action):
             return {}
         try:
             resp = await async_client.chat.completions.create(
-                model=MODEL_NAME_FAST,
+                model=MODEL_NAME_REASONING,
                 messages=[{"role": "user", "content": mech_prompt}],
                 temperature=0.1,
             )
@@ -1010,7 +1010,7 @@ class ActionAnalyzeMessage(Action):
 
         try:
             resp = await async_client.chat.completions.create(
-                model=MODEL_NAME_FAST,
+                model=MODEL_NAME_REASONING,
                 messages=[
                     {"role": "system", "content": system_msg},
                     {"role": "user", "content": user_msg},
@@ -1292,12 +1292,12 @@ class ActionAnalyzeMessage(Action):
 
         try:
             response = await async_client.chat.completions.create(
-                model=MODEL_NAME_FAST,  
+                model=MODEL_NAME_REASONING,
                 messages=[
                     {"role": "system", "content": system_msg},
                     {"role": "user", "content": user_prompt},
                 ],
-                temperature=0.8, 
+                temperature=0.4, 
                 max_tokens=15,
             )
             
@@ -1341,7 +1341,7 @@ class ActionAnalyzeMessage(Action):
         
         try:
             resp = await async_client.chat.completions.create(
-                model=MODEL_NAME_FAST,
+                model=MODEL_NAME_REASONING,
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=10,
                 temperature=0.1, 
@@ -1359,13 +1359,12 @@ class ActionAnalyzeMessage(Action):
             return "What do you associate with this fantasy?"
             
         system_msg = (
-            "You are a Lacanian analyst. The user is exhibiting Jouissance in a symptom, repetition compulsion, or highly charged fantasy. "
-            "Your task is to ask a question that targets the origins, timelines, or associative links of this Jouissance. "
+            "You are a Lacanian analyst. The user is exhibiting Jouissance in a symptom, repetition compulsion, or satisfaction found within a disturbing fantasy.\n"
+            "Your task is to formulate a question that targets the paradox of this satisfaction, the subject's complicity, or the specific point of excess.\n\n"
             "Rules:\n"
-            "1. Formulate ONE short, open-ended question using THEIR EXACT SIGNIFIERS AS MUCH AS YOU CAN.\n"
-            "2. The question must ask about the origin (e.g., 'When did this fantasy concerning [signifier] start?', 'How old were you when you started to think about [signifier]?') OR solicit free associations (e.g., 'What comes to mind when you think of [signifier]?', 'What do you associate with [signifier]?').\n"
-            "3. Use your intuition to determine whether an origin question or an associative question would be more appropriate based on the history, but you must always use the user's own language as much as possible.\n"
-            "4. Scan the recent history to make sure you construct your question to sound natural and you aren't robotically repeating something you have asked before.\n"
+            "2. Formulate ONE short, open-ended question using THEIR EXACT SIGNIFIERS, particularly their verbs of action or terms denoting bodily states.\n"
+            "3. Target the paradox: Highlight the contradiction between the conscious suffering and the unconscious drive (e.g., 'And yet you return to [signifier]?', 'What is the yield in this [signifier]?', 'What is it about [signifier] that is so unbearable?').\n"
+            "4. Scan the recent history to ensure your phrasing sounds natural and you are not repeating a previous question.\n"
             "5. Maximum 15 words.\n"
         )
         
@@ -1380,7 +1379,7 @@ class ActionAnalyzeMessage(Action):
                 model=MODEL_NAME_FAST,
                 messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
                 max_tokens=20,
-                temperature=0.5,
+                temperature=0.7,
             )
             return resp.choices[0].message.content.strip().strip("\"'")
         except Exception:
@@ -1409,7 +1408,7 @@ class ActionAnalyzeMessage(Action):
         
         try:
             resp = await async_client.chat.completions.create(
-                model=MODEL_NAME_FAST,
+                model=MODEL_NAME_REASONING,
                 messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
                 max_tokens=20,
                 temperature=0.4,
@@ -1429,7 +1428,7 @@ class ActionAnalyzeMessage(Action):
             "1. Deflect the demand for knowledge by asking a question that uses almost the same words they used.\n"
             "2. Produce exactly ONE short, natural question asking why they want you to tell them 'the answer' or what to do.\n"
             "3. Maximum 12 words.\n"
-            "Examples: 'What should my answer be?', 'You are hoping I will say?',"
+            "Examples: 'What would my answer be?', 'You are hoping I will say?', 'And I would tell you...?' "
         )
         
         user_msg = _apply_prior_history_limit(
@@ -1440,7 +1439,7 @@ class ActionAnalyzeMessage(Action):
         
         try:
             resp = await async_client.chat.completions.create(
-                model=MODEL_NAME_FAST,
+                model=MODEL_NAME_REASONING,
                 messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
                 max_tokens=20,
                 temperature=0.3,
@@ -1472,7 +1471,7 @@ class ActionAnalyzeMessage(Action):
             "articulate an experience that they are reluctant to share.\n\n"
             "Isolate the single most unfinished thought from the user's text.\n"
             "Echo the last part of that thought followed by a question mark.\n\n"
-            "Example: If the user says 'I have been experiencing a lot of... nevermind it's not worth taking about', output 'A lot of...?'\n"
+            "Example: If the user says 'I have been experiencing a lot of... nevermind it's not worth talking about', output 'A lot of...?'\n"
             "Example 2: If the user says 'I feel like I'm stuck in this... nah that's not important', output 'Stuck in this...?'\n"
             "Example 3: If the user says 'I'm not sure about this... it's complicated', output 'This...?'\n\n"    
         )
