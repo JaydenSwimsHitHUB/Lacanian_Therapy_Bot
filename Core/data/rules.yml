@@ -20,3 +20,8 @@ rules:
   steps:
     - intent: placeholder_intent
     - action: action_listen
+
+- rule: Trigger 30 minute session timeout
+  steps:
+    - intent: EXTERNAL_session_timeout
+    - action: action_execute_timeout

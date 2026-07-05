@@ -13,7 +13,7 @@ from cryptography.fernet import Fernet, InvalidToken
 from openai import AsyncOpenAI
 from rasa_sdk import Action, Tracker
 from rasa_sdk.executor import CollectingDispatcher
-from rasa_sdk.events import SlotSet, SessionStarted, ActionExecuted, EventType
+from rasa_sdk.events import SlotSet, SessionStarted, ActionExecuted, EventType, ReminderScheduled
 
 # --- SETUP ENCRYPTION ---
 # The key must be a URL-safe base64-encoded 32-byte key provided via Fly.io secrets
@@ -222,17 +222,17 @@ INTERJECTION_CHOICES = ["Ah?", "Oh?", "Elaborate?", "Say more?", "Mhmm?"]
 response_matrix: Dict[str, Dict[int, Optional[str]]] = {
     "contradiction": {1: "Hmm.",  2: "...", 3: "<oracle>", 4: "...", 5: "<gpt_metonymy>"},
     "repression": {1: "Ah?", 2: "...", 3: "<gpt_metonymy>", 4: "<oracle>"},
-    "negation": {1: None, 2: "<oracle>"}, 
+    "negation": {1: None, 2: "<oracle>", 3: "<gpt_metonymy>", 4: None}, 
     "jouissance": {1: "Oh?", 2: "<gpt_real_question>", 3: "<gpt_metonymy>", 4: "<oracle>", 5: "<gpt_metonymy>"},
     "rationalization": {1: "And yet...", 2: "...", 3: "<oracle>"},
     "morality_logic_defense": {1: "...", 2: "And yet...", 3: "<oracle>"},
     "circular_logic": {1: "...", 2: "Hmm.", 3: "<oracle>"},
     "master_signifier": {1: "<S1_echo>", 3: "<S1_triple_echo>", 4: "<oracle>"},
-    "condensation": {1: "<gpt_literalization>", 3: "<random_interjection>", 4: "<oracle>"},
+    "metaphor": {1: "<gpt_literalization>", 2: "<gpt_metonymy>", 3: "<random_interjection>", 4: "<oracle>"},
     "metonymy": {1: "<gpt_metonymy>", 2: "<gpt_metonymy>", 3: "<oracle>", 5: "<gpt_metonymy>"}, 
     "ambiguity": {1: "<gpt_ambiguity>", 2: "<gpt_ambiguity>", 3: "<oracle>"}, 
     "fetishistic_phrase": {1: "...", 2: "<oracle>"},
-    "identification_other_desire": {1: "<gpt_identification>", 2: "...", 3: "<oracle>", 5: "<gpt_metonymy>"}, 
+    "identification_other_desire": {1: "<gpt_identification>", 2: "<random_interjection>", 3: "<oracle>", 5: "<gpt_metonymy>"}, 
     "demand_for_knowledge": {1: "...", 2: "Hmm.", 3: "<oracle>", 4: "<gpt_desire_question>", 5: "<gpt_metonymy>"},
     "confession_empathy": {1: "...", 2: "Hmm.", 3: "<oracle>", 4: "<gpt_desire_question>", 5: "<oracle>"},
     "frame_protection": {1: "...", 2: "Hmm.", 3: "<oracle>"},
@@ -420,6 +420,8 @@ class ActionSessionStartCustom(Action):
         domain: Dict[Text, Any],
     ) -> List[EventType]:
         
+        start_time = time.time()
+        
         return [
             SessionStarted(),
             SlotSet("session_thematic_count", 0),
@@ -427,9 +429,39 @@ class ActionSessionStartCustom(Action):
             SlotSet("mechanism_counts", None),
             SlotSet("cut_trigger", None),
             SlotSet("dream_fantasy_asked", False),
-            SlotSet("session_start_time", time.time()),
+            SlotSet("session_start_time", start_time),
+            ReminderScheduled(
+                intent_name="EXTERNAL_session_timeout",
+                trigger_date_time=datetime.datetime.now() + datetime.timedelta(seconds=1800),
+                name="session_30_min_timeout",
+                kill_on_user_message=False,
+            ),
             ActionExecuted("action_listen"),
         ]
+    
+class ActionExecuteTimeout(Action):
+    def name(self) -> Text:
+        return "action_execute_timeout"
+
+    async def run(self, dispatcher, tracker, domain):
+        user_id = tracker.sender_id
+        session_start_time = tracker.get_slot("session_start_time")
+
+        # STATE CHECK: Has a scansion cut already locked this user out?
+        is_locked = await asyncio.to_thread(is_user_locked_out, DB_PATH, user_id)
+        if is_locked:
+            return []
+
+        # Send the proactive message
+        dispatcher.utter_message(
+            text="Our session time is up, to push further would encourage over-analysis.\n\nI will talk with you again in 48 hours."
+        )
+        
+        # Apply the lockout
+        if session_start_time:
+            await asyncio.to_thread(set_user_lockout, DB_PATH, user_id, 48, session_start_time)
+            
+        return []
 
 class ActionAnalyzeMessage(Action):
     def __init__(self):
@@ -663,15 +695,7 @@ class ActionAnalyzeMessage(Action):
         # --- CONTEXT EXTRACTION ---
         user_turn_count, raw_history_text, last_bot_text = _extract_session_context(tracker)
 
-        # --- DATABASE QUERIES ---
-        prior_history_messages, master_signifiers = await asyncio.gather(
-            asyncio.to_thread(get_prior_history_messages, DB_PATH, user_id, 800),
-            asyncio.to_thread(get_master_signifier_history, DB_PATH, user_id, 100)
-        )
-        
-        prior_history = "\n".join(f"- {msg}" for msg in prior_history_messages)
-        master_signifier_history = "\n".join(f"* {s}" for s in master_signifiers)
-        
+        # We can still safely fire off the background task to insert the new message
         if user_input:
             async def _safe_insert():
                 try:
@@ -680,8 +704,10 @@ class ActionAnalyzeMessage(Action):
                     pass
             asyncio.create_task(_safe_insert())
         
+        # --- EARLY EXIT: ROUTE TO INITIAL RESPONSE ---
+        # We process this BEFORE performing the heavy database queries
         if user_turn_count <= 3:
-            initial_response = await self._generate_initial_therapeutic_response(user_input, raw_history_text, prior_history)
+            initial_response = await self._generate_initial_therapeutic_response(user_input, raw_history_text)
             
             if initial_response == last_bot_text and initial_response != "...":
                 initial_response = "..."
@@ -689,21 +715,31 @@ class ActionAnalyzeMessage(Action):
             dispatcher.utter_message(text=initial_response)
             return []
             
+        # --- DATABASE QUERIES ---
+        # These will now only execute on turn 4 and beyond, saving resources
+        prior_history_messages, master_signifiers = await asyncio.gather(
+            asyncio.to_thread(get_prior_history_messages, DB_PATH, user_id, 800),
+            asyncio.to_thread(get_master_signifier_history, DB_PATH, user_id, 100)
+        )
+        
+        prior_history = "\n".join(f"- {msg}" for msg in prior_history_messages)
+        master_signifier_history = "\n".join(f"* {s}" for s in master_signifiers)
+        
         low = user_input.lower()
         if low == "/stop" or "i want to stop" in low:
             dispatcher.utter_message(text="...")
             return []
-            
+                        
         # ==== PASS 1: Local mechanism identification ===#
         allowed = list(ALLOWED_MECHANISMS)
         mech_template = (
             "- master_signifier: A signifier that repeats across history, often with low probability given what was uttered immediately before, and is thus ostensibly a fundamental authoritative, absolute fact that stabilizes the subject's identity or discourse. It is a 'just because' signifier that covers over the limits of meaning and language. It may return in disguised forms, such as in synonyms, homophones, homonyms, metaphors or words-within-words.\n"
-            "- identification_other_desire: Being governed by an imaginary external desire. Taking on another’s desire as one’s own.\n"
+            "- identification_other_desire: Identifying with a signifier that comes from the Symbolic Other.\n"
             "- transference_love: Seeking validation by saying what they believe you (the analyst) wants to hear.\n"
-            "- metonymy: The ego's defensive use of structural metonymy. The subject engages in endless sliding along a syntagmatic chain (chatter, empty speech) to avoid the emergence of an unconscious truth or a metaphorical anchoring point. Select this when the speech exhibits: (1) Topic-hopping without conclusion; (2) Cataloguing mundane events or facts; (3) Tangential drift; (4) Affective flattening; or (5) Seeking mirroring or validation through continuous narrative.\n"
+            "- metonymy: Speech that slides according to the law of structural metonymy. Present in free association and default speech in therapy when it slides along an associative chain.\n"
             "- repression: A signifier is barred from awareness but returns through symptoms, blanks, omissions, slips, or repetitions and other such phenomena.\n"
-            "- condensation: A structural rupture where one overwhelming signifier has been substituted for another, producing a metaphor. The metaphor must carry an emotional weight (which you can gather from the context) of a repressed trauma, desire, or fundamental fantasy.\n"
-            "- negation: Negating a thought or feeling. It could be denying a desire or keeping the real at bay by negating an existential truth. Saying “not X” both affirms the possible existence of X and keeps it at a managable distance. For example: 'I am never angry'; 'It is impossible that my father is gay'; 'I will become weak one day, but it is not this day'.\n"
+            "- metaphor: One traumatic, or overly charged signifier has been substituted for another, producing a metaphor. The manifest signifier hides the emotional weight of a repressed trauma, desire, or fundamental fantasy associated with the substituted signifier.\n"
+            "- negation: Negating a signifier or double negation within a phrase. It could be caused by denial, or an unconscious ambivalence, contradiction or overwhleming jouissance. Saying “not X” both affirms the possible existence of X and keeps it at a manageable distance. Look for grammatical indicators of negation.\n"
             "- rationalization: Plausible, logical explanation for thoughts or actions that actually stem from and conceal an unconscious desire.\n"
             "- morality_logic_defense: Defending against desire through idealized correctness and morality.\n"
             "- circular_logic: Reasoning loops back on itself.\n"
@@ -718,7 +754,7 @@ class ActionAnalyzeMessage(Action):
             "- stasis: The user is stuck, stops associating, expresses an inability to continue, or responds with silence (...) or gibberish.\n"
             "- unfinished_thought: The user expresses an idea that is incomplete, trailing off, or self-interrupted.\n"
             "- transference_lure: The user focuses on you (the analyst), makes demands of you, projects feelings onto you, or attempts to draw you into an Imaginary interpersonal dynamic.\n"
-            "- parapraxis: A slip of the tongue, a spoonerism, a misreading, an utterence that the user 'did not mean to say' or any such error that reveals an unconscious signifier. Include instances where a signifier feels 'out of place' or originates from a distant embedding space.\n\n"
+            "- parapraxis: A slip of the tongue, a spoonerism, a misreading, an utterance that the user 'did not mean to say' or any such error that reveals an unconscious signifier. Include instances where a signifier feels 'out of place' or originates from a distant embedding space.\n\n"
             "Master Signifier (S1) History (previously identified S1s for this user):\n"
             f"{master_signifier_history}\n\n"
             "Raw recent dialogue:\n"
@@ -849,26 +885,24 @@ class ActionAnalyzeMessage(Action):
             ),
         ]
 
-    async def _generate_initial_therapeutic_response(self, user_input: str, raw_history: str, prior_history: str) -> str:
+    async def _generate_initial_therapeutic_response(self, user_input: str, raw_history: str) -> str:
         prompt_template = (
-            "You are an insightful and empathetic therapist. Your goal for these initial messages at the bginning of a session is to build rapport by offering interpretations and mirroring that feel deeply personal to the user, even though they are based on universal psychological principles. This is a technique to make the user feel seen and understood, encouraging them to open up.\n\n"
+            "You are an insightful and empathetic Rogerian therapist. Your goal for these initial messages at the beginning of a session is to build rapport by offering interpretations and mirroring that feel deeply personal to the user, even though they are based on universal psychological principles. This is a technique to make the user feel seen and understood, encouraging them to open up.\n\n"
             "GUIDELINES:\n"
-            "1.  **Use Universal Themes:** Your interpretations should touch on common human conflicts and desires. Keep it personal.\n"
-            "2.  **Employ 'Barnum Statements':** Craft statements that are general enough to apply to most people but sound like specific, personal insights.\n"
-            "3.  **Validate and Reframe:** Acknowledge the user's feelings and gently reframe their situation.\n"
-            "4.  **Immediacy:** Respond to the content within the user's current message, in other words, focus on the immediate emotional context.\n"
-            "5.  **Maintain a Professional, Warm Tone:** The tone should be that of a skilled Rogerian therapist—calm, empathetic and reflective.\n"
-            "6.  **Keep Evolving to Sound Human:** Use the session history to see what you said before, how you said it, and how the user reacted. Then respond with the SESSION history in mind to deepen the therapeutic connection. Ensure you start each message differently so that you speak naturally.\n"
-            "7.  **Structural Constraint:** Formulate exactly ONE short, complete sentence (maximum 20 words). It must end decisively with a period or question mark.\n\n"
-            "PRIOR SESSION HISTORY (Long Term):\n" 
-            f"{PRIOR_HISTORY_TOKEN}\n\n"
+            "1.  **Employ 'Barnum Statements':** Craft statements that are general enough to apply to most people but sound like specific, personal insights.\n"
+            "2.  **Validate and Reframe:** Acknowledge the user's feelings and gently reframe their situation or ask a clarifying question.\n"
+            "3.  **Immediacy:** Respond to the emotional content within the user's current message, in other words, focus on the immediate emotional context.\n"
+            "4.  **Maintain a Professional, Warm Tone:** The tone should be that of a skilled Rogerian therapist—calm, empathetic and reflective.\n"
+            "5.  **Keep Evolving to Sound Human:** Use the session history to see what you said before, how you said it, and how the user reacted. Then respond with the SESSION history in mind to deepen the therapeutic connection. Ensure you start each message differently so that you speak naturally.\n"
+            "6.  **Structural Constraint:** Formulate exactly ONE short, complete sentence (maximum 30 words). It must end with a period or question mark.\n\n"
             "SESSION HISTORY:\n"
             f"{raw_history}\n\n"
             "USER'S LATEST MESSAGE:\n"
             f'"{user_input}"\n\n'
-            "Craft your singular, insightful therapeutic interpretation based on the entire conversation."
+            "Craft your response based on the entire conversation."
         )
-        prompt = _apply_prior_history_limit(prompt_template, prior_history, TOTAL_PROMPT_CHAR_LIMIT)
+        prompt = prompt_template
+        
         try:
             response_text = await self._generate_initial_response_async(prompt)
             return response_text
@@ -882,8 +916,8 @@ class ActionAnalyzeMessage(Action):
             resp = await async_client.chat.completions.create(
                 model=MODEL_NAME_FAST,
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.8,
-                max_tokens=100
+                temperature=0.4,
+                max_tokens=200
             )
             
             response_text = resp.choices[0].message.content.strip().replace('\n', ' ')
@@ -992,7 +1026,7 @@ class ActionAnalyzeMessage(Action):
             "3. INSISTENCE: A signifier that the user repeats unnecessarily throughout the current input or in this session.\n"
             "4. POLYSEMY: A signifier harboring high ambiguity, or multiple literal/figurative definitions when echoed back in isolation.\n\n"
             "NOTES:\n"
-            "Bias towards selecting a signifer from the user's current input.\n"
+            "Bias towards selecting a signifier from the user's current input.\n"
             "If you have asked about this signifier before in the session, look for another one.\n\n"
             "Rule:\n"
             "Output ONLY valid JSON in the following strict format:\n"
@@ -1126,7 +1160,7 @@ class ActionAnalyzeMessage(Action):
                     {"role": "user", "content": user_msg},
                 ],
                 max_tokens=20,
-                temperature=0.1, 
+                temperature=0.4, 
             )
             
             line = resp.choices[0].message.content.strip()
@@ -1145,16 +1179,16 @@ class ActionAnalyzeMessage(Action):
         if not async_client:
             return "Who?"
         system_msg = (
-            "You are a Lacanian analyst. The user is identifying with an external desire or the 'Other' (e.g., 'They want me to...', 'Society says...', 'My father thinks...', 'You are a sterile robot...', 'My mom's 'care' always...').\n"
-            "Task: Identify exactly WHO or WHAT the user is identifying with (The Agency/The Other/You, the analytic bot).\n"
-            "Output format: Return ONLY the signifier of the Agency/Other followed by a question mark.\n"
+            "You are a Lacanian analyst. The user is identifying with an external desire or signifier that comes from the 'Other' (e.g., 'They want me to be a doctor...', 'Society says I am a bad girl', 'My father thinks I am his favourite...', 'You think I am a sterile person.', 'My mom's 'care' always...').\n"
+            "Task: Identify exactly WHO or WHAT the user is identifying with (The Agency/The Other/You, the analytic bot) and the signifier they have adopted as part of their identity.\n"
+            "Output format: Return ONLY the signifier of the Agency/Other's desire followed by a question mark.\n"
             "Examples:\n"
-            "- User: 'My father wants me to be a doctor.' -> Output: 'Your father?'\n"
-            "- User: 'Everyone thinks I am crazy.' -> Output: 'Everyone?'\n"
-            "- User: 'I need to be productive for the economy.' -> Output: 'The economy?'\n"
-            "- User: 'You don't love me.' -> Output: 'You?'\n"
-            "- User: 'My mom's care is suffocating.' -> Output: 'Mom's care?'\n"
-            "- User: 'Society's expectations are overwhelming.' -> Output: 'Society?'\n"
+            "- User: 'My father wants me to be a doctor.' -> Output: 'Doctor?'\n"
+            "- User: 'Everyone thinks I am crazy.' -> Output: 'Crazy?'\n"
+            "- User: 'I need to be productive for the economy.' -> Output: 'Productive?'\n"
+            "- User: 'You don't love me.' -> Output: 'Don't love you?'\n"
+            "- User: 'My mom's care is suffocating.' -> Output: 'Suffocating?'\n"
+            "- User: 'Society's expectations are overwhelming.' -> Output: 'Overwhelming?'\n"
             ""
         )
         user_msg = f"User text: \"{user_input}\""
@@ -1283,7 +1317,7 @@ class ActionAnalyzeMessage(Action):
             "Constraints:\n"
             "- Output length: 1 to 5 words.\n"
             "- Lexical source: Exclusively the current Utterance.\n"
-            "- Tone: Cryptic, jarring, and disruptive.\n"
+            "- Tone: Trippy, jarring, and disruptive.\n"
             "- Structure: A declarative statement ending in a period."
         )
 
@@ -1364,7 +1398,7 @@ class ActionAnalyzeMessage(Action):
             "Rules:\n"
             "2. Formulate ONE short, open-ended question using THEIR EXACT SIGNIFIERS, particularly their verbs of action or terms denoting bodily states.\n"
             "3. Target the paradox: Highlight the contradiction between the conscious suffering and the unconscious drive (e.g., 'And yet you return to [signifier]?', 'What is the yield in this [signifier]?', 'What is it about [signifier] that is so unbearable?').\n"
-            "4. Scan the recent history to ensure your phrasing sounds natural and you are not repeating a previous question.\n"
+            "4. Scan the recent history to ensure your phrasing sounds natural and you are not repeating a previous question or a questioning structure.\n"
             "5. Maximum 15 words.\n"
         )
         
@@ -1379,7 +1413,7 @@ class ActionAnalyzeMessage(Action):
                 model=MODEL_NAME_FAST,
                 messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
                 max_tokens=20,
-                temperature=0.7,
+                temperature=0.6,
             )
             return resp.choices[0].message.content.strip().strip("\"'")
         except Exception:
@@ -1441,7 +1475,7 @@ class ActionAnalyzeMessage(Action):
             resp = await async_client.chat.completions.create(
                 model=MODEL_NAME_REASONING,
                 messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
-                max_tokens=20,
+                max_tokens=30,
                 temperature=0.3,
             )
             return resp.choices[0].message.content.strip().strip("\"'")

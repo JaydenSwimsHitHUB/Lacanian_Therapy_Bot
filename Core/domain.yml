@@ -6,16 +6,18 @@ intents:
   - placeholder_intent
   - nlu_fallback
   - restart
+  - EXTERNAL_session_timeout
 
 responses:
   utter_start:
-    - text: "So what's on your heart? Speak freely and tell me everything that comes to mind."
+    - text: "So what's on your heart? Speak freely and tell me everything that comes to mind. Try to not censor your thoughts, and don't worry about whether they make sense. Just let your mind wander and share whatever comes up. "
   utter_fallback:
     - text: "..."
 
 actions:
   - action_analyze_message
-  - action_session_start_custom
+  - action_session_start
+  - action_execute_timeout
 
 slots:
   session_thematic_count:
