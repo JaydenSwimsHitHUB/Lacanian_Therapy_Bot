@@ -916,8 +916,8 @@ class ActionAnalyzeMessage(Action):
             resp = await async_client.chat.completions.create(
                 model=MODEL_NAME_FAST,
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.4,
-                max_tokens=200
+                temperature=0.8,
+                max_tokens=100
             )
             
             response_text = resp.choices[0].message.content.strip().replace('\n', ' ')
@@ -1412,8 +1412,8 @@ class ActionAnalyzeMessage(Action):
             resp = await async_client.chat.completions.create(
                 model=MODEL_NAME_FAST,
                 messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
-                max_tokens=20,
-                temperature=0.6,
+                max_tokens=100,
+                temperature=0.5,
             )
             return resp.choices[0].message.content.strip().strip("\"'")
         except Exception:

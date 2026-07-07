@@ -17,6 +17,7 @@ RUN if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
 # Force Python implementation of Protobuf to avoid runtime conflicts
 ENV PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
+
 # Ensure Python outputs are unbuffered so logs appear in real-time
 ENV PYTHONUNBUFFERED=1
 
