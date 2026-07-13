@@ -37,22 +37,28 @@ def _decrypt(text: str) -> str:
 
 # --- SETUP CLIENT FOR DOLPHIN LLAMA ---
 api_key = os.getenv("OPENAI_API_KEY")
-base_url = os.getenv("API_BASE_URL", "https://api.deepinfra.com/v1/openai") 
+base_url = os.getenv("API_BASE_URL", "https://api.deepinfra.com/v1/openai")
+llm_timeout = float(os.getenv("LLM_REQUEST_TIMEOUT", "90"))
 
 if api_key:
-    async_client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+    async_client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=llm_timeout)
 else:
     async_client = None
 
-# Model names
-MODEL_NAME_FAST = "Qwen/Qwen2.5-72B-Instruct"
-MODEL_NAME_REASONING = "Qwen/Qwen2.5-72B-Instruct"
-
-# Request controls
-REQUEST_TIMEOUT_SECONDS = 10.0
+# Fast model for rapport, JSON classification, and short interventions.
+# Reasoning model reserved for complex Lacanian generation (metonymy, oracle, S1 extraction).
+MODEL_NAME_FAST = os.getenv(
+    "MODEL_NAME_FAST",
+    "meta-llama/Meta-Llama-3-8B-Instruct",
+)
+MODEL_NAME_REASONING = os.getenv(
+    "MODEL_NAME_REASONING",
+    "meta-llama/Meta-Llama-3-8B-Instruct",
+)
 
 # Prompt size controls (chars)
-TOTAL_PROMPT_CHAR_LIMIT = 32000
+TOTAL_PROMPT_CHAR_LIMIT = int(os.getenv("TOTAL_PROMPT_CHAR_LIMIT", "12000"))
+PRIOR_HISTORY_PROMPT_LIMIT = int(os.getenv("PRIOR_HISTORY_PROMPT_LIMIT", "100"))
 PRIOR_HISTORY_TOKEN = "__PRIOR_HISTORY__"
 TRUNCATION_MARKER = "...(truncated)\n"
 
@@ -69,27 +75,6 @@ def _get_db_conn(db_path: str):
     with sqlite3.connect(db_path, timeout=10.0) as conn:
         conn.execute("PRAGMA journal_mode=WAL")
         yield conn
-
-async def _call_openai_chat_completion(
-    model: str,
-    messages: List[Dict[str, Any]],
-    *,
-    max_tokens: Optional[int] = None,
-    temperature: Optional[float] = None,
-) -> Any:
-    if not async_client:
-        raise RuntimeError("OpenAI client is not configured")
-
-    kwargs: Dict[str, Any] = {"model": model, "messages": messages}
-    if max_tokens is not None:
-        kwargs["max_tokens"] = max_tokens
-    if temperature is not None:
-        kwargs["temperature"] = temperature
-
-    return await asyncio.wait_for(
-        async_client.chat.completions.create(**kwargs),
-        timeout=REQUEST_TIMEOUT_SECONDS,
-    )
 
 # Database functions
 def insert_user_message(db_path: str, user_id: str, message: str) -> None:
@@ -162,33 +147,19 @@ def _insert_master_signifiers(db_path: str, user_id: str, s1_list: list) -> None
             conn.commit()
 
 # --- LOCKOUT DATABASE FUNCTIONS ---
-def set_user_lockout(db_path: str, user_id: str, hours: int = 48, base_time: Optional[float] = None) -> None:
-    """Sets a timestamp in the database until which the user is ignored.
-    
-    Args:
-        db_path: Path to the database
-        user_id: User ID
-        hours: Number of hours to lock out
-        base_time: Base timestamp to calculate from. If None, uses current time.
-    """
-    if base_time is None:
-        base_time = time.time()
-    unlock_time = base_time + (hours * 3600)
+def clear_user_lockout(db_path: str, user_id: str) -> None:
+    """Removes any stored lockout for the given user."""
     with _get_db_conn(db_path) as conn:
-        conn.execute(
-            "INSERT OR REPLACE INTO user_lockouts (user_id, lockout_until) VALUES (?, ?)",
-            (user_id, unlock_time)
-        )
+        conn.execute("DELETE FROM user_lockouts WHERE user_id = ?", (user_id,))
         conn.commit()
 
+def set_user_lockout(db_path: str, user_id: str, hours: int = 48, base_time: Optional[float] = None) -> None:
+    """Disabled: user lockouts are intentionally not enforced."""
+    return None
+
 def is_user_locked_out(db_path: str, user_id: str) -> bool:
-    """Checks if the current time is before the user's lockout expiration."""
-    with _get_db_conn(db_path) as conn:
-        cursor = conn.execute("SELECT lockout_until FROM user_lockouts WHERE user_id = ?", (user_id,))
-        row = cursor.fetchone()
-        if row:
-            return time.time() < row[0]
-        return False
+    """Disabled: always returns False so the user is never locked out."""
+    return False
 
 # --- UTILITY HELPERS ---
 def _strip_response(text: str) -> str:
@@ -390,6 +361,71 @@ cut_trigger: null or one of {cuts}.
 """
     return _apply_prior_history_limit(template, prior_history_str, TOTAL_PROMPT_CHAR_LIMIT)
 
+MECHANISM_DEFINITIONS = (
+    "- master_signifier: A signifier that repeats across history, often with low probability given what was uttered immediately before, and is thus ostensibly a fundamental authoritative, absolute fact that stabilizes the subject's identity or discourse. It is a 'just because' signifier that covers over the limits of meaning and language. It may return in disguised forms, such as in synonyms, homophones, homonyms, metaphors or words-within-words.\n"
+    "- identification_other_desire: Identifying with a signifier that comes from the Symbolic Other.\n"
+    "- transference_love: Seeking validation by saying what they believe you (the analyst) wants to hear.\n"
+    "- metonymy: Speech that slides according to the law of structural metonymy. Present in free association and default speech in therapy when it slides along an associative chain.\n"
+    "- repression: A signifier is barred from awareness but returns through symptoms, blanks, omissions, slips, or repetitions and other such phenomena.\n"
+    "- metaphor: One traumatic, or overly charged signifier has been substituted for another, producing a metaphor. The manifest signifier hides the emotional weight of a repressed trauma, desire, or fundamental fantasy associated with the substituted signifier.\n"
+    "- negation: Negating a signifier or double negation within a phrase. It could be caused by denial, or an unconscious ambivalence, contradiction or overwhleming jouissance. Saying “not X” both affirms the possible existence of X and keeps it at a manageable distance. Look for grammatical indicators of negation.\n"
+    "- rationalization: Plausible, logical explanation for thoughts or actions that actually stem from and conceal an unconscious desire.\n"
+    "- morality_logic_defense: Defending against desire through idealized correctness and morality.\n"
+    "- circular_logic: Reasoning loops back on itself.\n"
+    "- contradiction: A later statement cancels or undoes an earlier one without the speaker acknowledging or realizing the conflict.\n"
+    "- jouissance: The paradox where the subject derives satisfaction from a symptom that is consciously painful or unpleasant. Do not look for 'happiness' but for the Drive (the loop). At least three of the following criteria must be met for you to select this mechanism: (1) Repetition ('I keep doing it', 'again and again'); (2) Paradox ('I hate it but I can't stop', 'awful but I need it'); (3) Excess ('overwhelming', 'too much', 'unbearable'); (4) The Body (physical symptoms, vomiting, shaking) alongside painful, excessive emotion; (5) Fixation on a partial object.\n"
+    "- ambiguity: Indeterminate referents.\n"
+    "- fetishistic_phrase: Clichés that halt the exploration of desire(s). Common phrases that are impersonal and formulaic.\n"
+    "- demand_for_knowledge: Demand(s) for knowledge and inquiries leveled at you.\n"
+    "- confession_empathy: Seeking rescue or closeness.\n"
+    "- dream_report: The user recounts a dream, nightmare, or a fragment of a dream.\n"
+    "- frame_protection: Demands for the session to end.\n"
+    "- stasis: The user is stuck, stops associating, expresses an inability to continue, or responds with silence (...) or gibberish.\n"
+    "- unfinished_thought: The user expresses an idea that is incomplete, trailing off, or self-interrupted.\n"
+    "- transference_lure: The user focuses on you (the analyst), makes demands of you, projects feelings onto you, or attempts to draw you into an Imaginary interpersonal dynamic.\n"
+    "- parapraxis: A slip of the tongue, a spoonerism, a misreading, an utterance that the user 'did not mean to say' or any such error that reveals an unconscious signifier. Include instances where a signifier feels 'out of place' or originates from a distant embedding space.\n"
+)
+
+def build_combined_analysis_prompt(
+    new_input: str,
+    raw_history: str,
+    prior_history_str: str,
+    master_signifier_history: str,
+    allowed_mechanisms: List[str],
+) -> str:
+    cuts = CUT_TRIGGERS
+    template = (
+        "You are a Lacanian analyst. Perform TWO analyses on the NEW user input in a single pass.\n\n"
+        "# TASK 1: Defense Mechanism Detection\n"
+        "Identify the dominant Lacanian defense mechanism in the NEW input.\n"
+        f"{MECHANISM_DEFINITIONS}\n"
+        "Master Signifier (S1) History (previously identified S1s for this user):\n"
+        f"{master_signifier_history}\n\n"
+        "Raw recent dialogue:\n"
+        f"{raw_history}\n\n"
+        "Prior (Long Term) history:\n"
+        f"{PRIOR_HISTORY_TOKEN}\n\n"
+        "NEW user input:\n"
+        f'"{new_input}"\n\n'
+        "RULE: If and only if you select \"master_signifier\" as the mechanism, you MUST also return the specific anchoring signifier in the \"master_signifier\" field. Otherwise leave it null.\n\n"
+        "# TASK 2: Scansion (Cut) Detection\n"
+        "Scan for a session-ending cut trigger. Read master signifier history, prior history, session dialogue, then NEW input chronologically.\n"
+        "- major_shift_retroactive: A sudden rupture in the Automaton. The user has been speaking in a well established Imaginary 'script' with predictable signifiers (ego-level discourse), and suddenly a signifier intrudes that is probabilistically very unlikely and therefore ruptures the ego-level discourse. The intruder is identified_s1.\n"
+        "You CANNOT cut if it is even slightly unclear what the ego-level script is.\n\n"
+        "Respond in strict JSON:\n"
+        "{\n"
+        '  "mechanism": "one of the allowed" or null,\n'
+        '  "mechanism_phrase": "exact substring from NEW input" or null,\n'
+        '  "master_signifier": "the S1 signifier" or null,\n'
+        '  "cut_trigger": "label" or null,\n'
+        '  "identified_s1": "signifier" or null\n'
+        "}\n\n"
+        f"Allowed mechanisms: {allowed_mechanisms}\n"
+        f"Allowed cut_trigger values: null or one of {cuts}.\n"
+        "Only output exactly one valid JSON object."
+    )
+    return _apply_prior_history_limit(template, prior_history_str, TOTAL_PROMPT_CHAR_LIMIT)
+
 def build_cut_construction_prompt(
     new_input: str,
     identified_s1: str,
@@ -445,6 +481,8 @@ class ActionSessionStartCustom(Action):
     ) -> List[EventType]:
         
         start_time = time.time()
+        user_id = tracker.sender_id
+        await asyncio.to_thread(clear_user_lockout, DB_PATH, user_id)
         
         return [
             SessionStarted(),
@@ -580,14 +618,14 @@ class ActionAnalyzeMessage(Action):
             user_msg_limit = TOTAL_PROMPT_CHAR_LIMIT - len(system_msg)
             user_msg = _apply_prior_history_limit(user_msg_template, prior_history_text, user_msg_limit)
             
-            resp = await _call_openai_chat_completion(
-                MODEL_NAME_REASONING,
-                [
+            resp = await async_client.chat.completions.create(
+                model=MODEL_NAME_REASONING,
+                messages=[
                     {"role": "system", "content": system_msg},
                     {"role": "user", "content": user_msg}
                 ],
                 temperature=0.1,
-                max_tokens=1500,
+                max_tokens=1500
             )
             
             content = resp.choices[0].message.content.strip()
@@ -624,60 +662,29 @@ class ActionAnalyzeMessage(Action):
         counts[mechanism] = cnt
         return counts, cnt
 
-    async def _call_mech_api(self, mech_prompt: str) -> Dict[str, Any]:
+    async def _call_combined_analysis_api(self, prompt: str) -> Dict[str, Any]:
         if not async_client:
             return {}
         try:
-            resp = await _call_openai_chat_completion(
-                MODEL_NAME_REASONING,
-                [{"role": "user", "content": mech_prompt}],
+            resp = await async_client.chat.completions.create(
+                model=MODEL_NAME_FAST,
+                messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
+                max_tokens=500,
             )
             return _extract_json(resp.choices[0].message.content.strip())
         except Exception:
             return {}
 
-    async def _call_scansion_api(self, scansion_prompt: str) -> Dict[str, Any]:
-        if not async_client:
-            return {}
-        try:
-            resp = await _call_openai_chat_completion(
-                MODEL_NAME_REASONING,
-                [{"role": "user", "content": scansion_prompt}],
-                temperature=0.1,
-                max_tokens=600,
-            )
-            return _extract_json(resp.choices[0].message.content.strip())
-        except Exception:
-            return {}
-
-    async def _get_responses_parallel_async(
-        self,
-        mech_prompt: str,
-        scansion_prompt: str,
-        include_scansion: bool = True,
-    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        try:
-            if not include_scansion:
-                data1 = await self._call_mech_api(mech_prompt)
-                return data1, {}
-
-            data1, data2 = await asyncio.gather(
-                self._call_mech_api(mech_prompt),
-                self._call_scansion_api(scansion_prompt)
-            )
-            return data1, data2
-        except Exception:
-            return {}, {}
-    
     async def _cut_construction_async(self, prompt2b: str) -> Optional[str]:
         if not async_client:
             return None
         try:
-            resp = await _call_openai_chat_completion(
-                MODEL_NAME_FAST,
-                [{"role": "user", "content": prompt2b}],
+            resp = await async_client.chat.completions.create(
+                model=MODEL_NAME_FAST,
+                messages=[{"role": "user", "content": prompt2b}],
                 temperature=0.1,
+                max_tokens=300,
             )
             data2b = _extract_json(resp.choices[0].message.content.strip())
             cut_phrase = data2b.get("cut_phrase")
@@ -728,18 +735,14 @@ class ActionAnalyzeMessage(Action):
         # --- CONTEXT EXTRACTION ---
         user_turn_count, raw_history_text, last_bot_text = _extract_session_context(tracker)
 
-        # ---------------------------------------------------------
-        # EXPERIMENT CORRECTION: 
-        # Store a reference to the task instead of firing and forgetting.
-        # ---------------------------------------------------------
-        insert_task = None
+        # We can still safely fire off the background task to insert the new message
         if user_input:
             async def _safe_insert():
                 try:
                     await asyncio.to_thread(insert_user_message, DB_PATH, user_id, user_input)
                 except Exception:
                     pass
-            insert_task = asyncio.create_task(_safe_insert())
+            asyncio.create_task(_safe_insert())
         
         # --- EARLY EXIT: ROUTE TO INITIAL RESPONSE ---
         # We process this BEFORE performing the heavy database queries
@@ -753,17 +756,9 @@ class ActionAnalyzeMessage(Action):
             return []
             
         # --- DATABASE QUERIES ---
-        # ---------------------------------------------------------
-        # EXPERIMENT CORRECTION:
-        # Enforce sequential execution. Await the write operation before 
-        # querying the database to eliminate race conditions.
-        # ---------------------------------------------------------
-        if insert_task:
-            await insert_task
-
         # These will now only execute on turn 4 and beyond, saving resources
         prior_history_messages, master_signifiers = await asyncio.gather(
-            asyncio.to_thread(get_prior_history_messages, DB_PATH, user_id, 800),
+            asyncio.to_thread(get_prior_history_messages, DB_PATH, user_id, PRIOR_HISTORY_PROMPT_LIMIT),
             asyncio.to_thread(get_master_signifier_history, DB_PATH, user_id, 100)
         )
         
@@ -775,63 +770,17 @@ class ActionAnalyzeMessage(Action):
             dispatcher.utter_message(text="...")
             return []
                         
-        # ==== PASS 1: Local mechanism identification ===#
+        # ==== PASS 1: Combined mechanism + scansion detection (single LLM call) ===#
         allowed = list(ALLOWED_MECHANISMS)
-        mech_template = (
-            "- master_signifier: A signifier that repeats across history, often with low probability given what was uttered immediately before, and is thus ostensibly a fundamental authoritative, absolute fact that stabilizes the subject's identity or discourse. It is a 'just because' signifier that covers over the limits of meaning and language. It may return in disguised forms, such as in synonyms, homophones, homonyms, metaphors or words-within-words.\n"
-            "- identification_other_desire: Identifying with a signifier that comes from the Symbolic Other.\n"
-            "- transference_love: Seeking validation by saying what they believe you (the analyst) wants to hear.\n"
-            "- metonymy: Speech that slides according to the law of structural metonymy. Present in free association and default speech in therapy when it slides along an associative chain.\n"
-            "- repression: A signifier is barred from awareness but returns through symptoms, blanks, omissions, slips, or repetitions and other such phenomena.\n"
-            "- metaphor: One traumatic, or overly charged signifier has been substituted for another, producing a metaphor. The manifest signifier hides the emotional weight of a repressed trauma, desire, or fundamental fantasy associated with the substituted signifier.\n"
-            "- negation: Negating a signifier or double negation within a phrase. It could be caused by denial, or an unconscious ambivalence, contradiction or overwhleming jouissance. Saying “not X” both affirms the possible existence of X and keeps it at a manageable distance. Look for grammatical indicators of negation.\n"
-            "- rationalization: Plausible, logical explanation for thoughts or actions that actually stem from and conceal an unconscious desire.\n"
-            "- morality_logic_defense: Defending against desire through idealized correctness and morality.\n"
-            "- circular_logic: Reasoning loops back on itself.\n"
-            "- contradiction: A later statement cancels or undoes an earlier one without the speaker acknowledging or realizing the conflict.\n"
-            "- jouissance: The paradox where the subject derives satisfaction from a symptom that is consciously painful or unpleasant. Do not look for 'happiness' but for the Drive (the loop). At least three of the following criteria must be met for you to select this mechanism: (1) Repetition ('I keep doing it', 'again and again'); (2) Paradox ('I hate it but I can't stop', 'awful but I need it'); (3) Excess ('overwhelming', 'too much', 'unbearable'); (4) The Body (physical symptoms, vomiting, shaking) alongside painful, excessive emotion; (5) Fixation on a partial object.\n"
-            "- ambiguity: Indeterminate referents.\n"
-            "- fetishistic_phrase: Clichés that halt the exploration of desire(s). Common phrases that are impersonal and formulaic.\n"
-            "- demand_for_knowledge: Demand(s) for knowledge and inquiries leveled at you.\n"
-            "- confession_empathy: Seeking rescue or closeness.\n"
-            "- dream_report: The user recounts a dream, nightmare, or a fragment of a dream.\n"
-            "- frame_protection: Demands for the session to end.\n"
-            "- stasis: The user is stuck, stops associating, expresses an inability to continue, or responds with silence (...) or gibberish.\n"
-            "- unfinished_thought: The user expresses an idea that is incomplete, trailing off, or self-interrupted.\n"
-            "- transference_lure: The user focuses on you (the analyst), makes demands of you, projects feelings onto you, or attempts to draw you into an Imaginary interpersonal dynamic.\n"
-            "- parapraxis: A slip of the tongue, a spoonerism, a misreading, an utterance that the user 'did not mean to say' or any such error that reveals an unconscious signifier. Include instances where a signifier feels 'out of place' or originates from a distant embedding space.\n\n"
-            "Master Signifier (S1) History (previously identified S1s for this user):\n"
-            f"{master_signifier_history}\n\n"
-            "Raw recent dialogue:\n"
-            f"{raw_history_text}\n\n"
-            "Prior (Long Term) history:\n"
-            f"{PRIOR_HISTORY_TOKEN}\n\n"
-            "NEW user input:\n"
-            f'"{user_input}"\n\n'
-            "RULE: If and only if you select \"master_signifier\" as the mechanism, you MUST also return the specific anchoring signifier in the \"master_signifier\" field. Otherwise leave it null.\n\n"
-            "Respond in strict JSON:\n"
-            "{\n"
-            '  "mechanism": "one of the allowed" or null,\n'
-            '  "mechanism_phrase": "exact substring from NEW input" or null,\n'
-            '  "master_signifier": "the S1 signifier" or null\n'
-            "}\n\n"
-            f"Allowed: {allowed}\n"
-            "Only output exactly one valid JSON object."
+        combined_prompt = build_combined_analysis_prompt(
+            user_input, raw_history_text, prior_history, master_signifier_history, allowed
         )
-        mech_prompt = _apply_prior_history_limit(mech_template, prior_history, TOTAL_PROMPT_CHAR_LIMIT)
+        data = await self._call_combined_analysis_api(combined_prompt)
 
-        # ==== PASS 1 & 2a: PARALLEL CALLS FOR SPEED ===#
-        prompt2a = build_cut_detection_prompt(user_input, raw_history_text, prior_history, master_signifier_history)
-        include_scansion = user_turn_count >= 7
-        data1, data2 = await self._get_responses_parallel_async(
-            mech_prompt,
-            prompt2a,
-            include_scansion=include_scansion,
-        )
-
-        mech: Optional[str] = data1.get("mechanism")
-        mech_phrase: Optional[str] = data1.get("mechanism_phrase")
-        detected_s1: Optional[str] = data1.get("master_signifier")
+        mech: Optional[str] = data.get("mechanism")
+        mech_phrase: Optional[str] = data.get("mechanism_phrase")
+        detected_s1: Optional[str] = data.get("master_signifier")
+        print(f"Mechanism chosen: {mech}")
         
         # Enforce strict length constraint to prohibit the corruption of S1 context by multi-word sentences
         if not detected_s1 and mech == "master_signifier" and mech_phrase:
@@ -850,8 +799,8 @@ class ActionAnalyzeMessage(Action):
             asyncio.create_task(_safe_s1_insert())
 
         # ==== PASS 2: Potential Cut Trigger Identification ===#
-        potential_trigger: Optional[str] = data2.get("cut_trigger")
-        identified_s1: Optional[str] = data2.get("identified_s1")
+        potential_trigger: Optional[str] = data.get("cut_trigger")
+        identified_s1: Optional[str] = data.get("identified_s1")
         potential_trigger_phrase: Optional[str] = None
         
         verified_trigger: Optional[str] = None
@@ -863,7 +812,6 @@ class ActionAnalyzeMessage(Action):
             prompt2b = build_cut_construction_prompt(user_input, identified_s1)
             potential_trigger_phrase = await self._cut_construction_async(prompt2b)
             
-        data2["cut_phrase"] = potential_trigger_phrase
         final_trigger_phrase = potential_trigger_phrase if verified_trigger else None
         
         if isinstance(final_trigger_phrase, str):
@@ -963,11 +911,11 @@ class ActionAnalyzeMessage(Action):
         if not async_client:
             return "..."
         try:
-            resp = await _call_openai_chat_completion(
-                MODEL_NAME_FAST,
-                [{"role": "user", "content": prompt}],
+            resp = await async_client.chat.completions.create(
+                model=MODEL_NAME_FAST,
+                messages=[{"role": "user", "content": prompt}],
                 temperature=0.8,
-                max_tokens=100,
+                max_tokens=100
             )
             
             response_text = resp.choices[0].message.content.strip().replace('\n', ' ')
@@ -1093,14 +1041,14 @@ class ActionAnalyzeMessage(Action):
         user_msg = user_msg_template
 
         try:
-            resp = await _call_openai_chat_completion(
-                MODEL_NAME_REASONING,
-                [
+            resp = await async_client.chat.completions.create(
+                model=MODEL_NAME_REASONING,
+                messages=[
                     {"role": "system", "content": system_msg},
                     {"role": "user", "content": user_msg},
                 ],
                 temperature=0.2,
-                max_tokens=25,
+                max_tokens=25, 
             )
             
             content = resp.choices[0].message.content.strip()
@@ -1203,14 +1151,14 @@ class ActionAnalyzeMessage(Action):
         user_msg = _apply_prior_history_limit(user_msg_template, prior_history, user_msg_limit)
         
         try:
-            resp = await _call_openai_chat_completion(
-                MODEL_NAME_FAST,
-                [
+            resp = await async_client.chat.completions.create(
+                model=MODEL_NAME_FAST,
+                messages=[
                     {"role": "system", "content": system_msg},
                     {"role": "user", "content": user_msg},
                 ],
                 max_tokens=20,
-                temperature=0.4,
+                temperature=0.4, 
             )
             
             line = resp.choices[0].message.content.strip()
@@ -1246,9 +1194,9 @@ class ActionAnalyzeMessage(Action):
     
     async def _gpt_identification_intervention_async(self, system_msg: str, user_msg: str) -> str:
         try:
-            resp = await _call_openai_chat_completion(
-                MODEL_NAME_FAST,
-                [
+            resp = await async_client.chat.completions.create(
+                model=MODEL_NAME_FAST,
+                messages=[
                     {"role": "system", "content": system_msg},
                     {"role": "user", "content": user_msg},
                 ],
@@ -1278,9 +1226,9 @@ class ActionAnalyzeMessage(Action):
         )
         user_msg = f"User text: \"{user_input}\""
         try:
-            resp = await _call_openai_chat_completion(
-                MODEL_NAME_FAST,
-                [
+            resp = await async_client.chat.completions.create(
+                model=MODEL_NAME_FAST,
+                messages=[
                     {"role": "system", "content": system_msg},
                     {"role": "user", "content": user_msg},
                 ],
@@ -1327,9 +1275,9 @@ class ActionAnalyzeMessage(Action):
     
     async def _gpt_denial_intervention_async(self, system_msg: str, user_msg: str) -> str:
         try:
-            resp = await _call_openai_chat_completion(
-                MODEL_NAME_FAST,
-                [
+            resp = await async_client.chat.completions.create(
+                model=MODEL_NAME_FAST,
+                messages=[
                     {"role": "system", "content": system_msg},
                     {"role": "user", "content": user_msg},
                 ],
@@ -1375,13 +1323,13 @@ class ActionAnalyzeMessage(Action):
         user_prompt = _apply_prior_history_limit(user_prompt_template, prior_history, user_prompt_limit)
 
         try:
-            response = await _call_openai_chat_completion(
-                MODEL_NAME_REASONING,
-                [
+            response = await async_client.chat.completions.create(
+                model=MODEL_NAME_REASONING,
+                messages=[
                     {"role": "system", "content": system_msg},
                     {"role": "user", "content": user_prompt},
                 ],
-                temperature=0.4,
+                temperature=0.4, 
                 max_tokens=15,
             )
             
@@ -1424,11 +1372,11 @@ class ActionAnalyzeMessage(Action):
         ) + f'"{user_input}"\n\nReturn only the single, capitalized signifier with a question mark:'
         
         try:
-            resp = await _call_openai_chat_completion(
-                MODEL_NAME_REASONING,
-                [{"role": "user", "content": prompt}],
+            resp = await async_client.chat.completions.create(
+                model=MODEL_NAME_REASONING,
+                messages=[{"role": "user", "content": prompt}],
                 max_tokens=10,
-                temperature=0.1,
+                temperature=0.1, 
             )
             line = _strip_response(resp.choices[0].message.content)
             line = re.sub(r"[^\w\s-]", "", line, flags=re.UNICODE).strip()
@@ -1459,9 +1407,9 @@ class ActionAnalyzeMessage(Action):
         )
         
         try:
-            resp = await _call_openai_chat_completion(
-                MODEL_NAME_FAST,
-                [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
+            resp = await async_client.chat.completions.create(
+                model=MODEL_NAME_FAST,
+                messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
                 max_tokens=100,
                 temperature=0.5,
             )
@@ -1491,9 +1439,9 @@ class ActionAnalyzeMessage(Action):
         )
         
         try:
-            resp = await _call_openai_chat_completion(
-                MODEL_NAME_REASONING,
-                [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
+            resp = await async_client.chat.completions.create(
+                model=MODEL_NAME_REASONING,
+                messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
                 max_tokens=20,
                 temperature=0.4,
             )
@@ -1522,9 +1470,9 @@ class ActionAnalyzeMessage(Action):
         )
         
         try:
-            resp = await _call_openai_chat_completion(
-                MODEL_NAME_REASONING,
-                [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
+            resp = await async_client.chat.completions.create(
+                model=MODEL_NAME_REASONING,
+                messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
                 max_tokens=30,
                 temperature=0.3,
             )
@@ -1567,9 +1515,9 @@ class ActionAnalyzeMessage(Action):
         )
         
         try:
-            resp = await _call_openai_chat_completion(
-                MODEL_NAME_FAST,
-                [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
+            resp = await async_client.chat.completions.create(
+                model=MODEL_NAME_FAST,
+                messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
                 max_tokens=10,
                 temperature=0.1,
             )
@@ -1596,14 +1544,14 @@ class ActionAnalyzeMessage(Action):
         user_msg = f"User Phrase containing the slip: \"{mechanism_phrase}\"\n\nOutput the JSON Slip:"
 
         try:
-            resp = await _call_openai_chat_completion(
-                MODEL_NAME_FAST,
-                [
+            resp = await async_client.chat.completions.create(
+                model=MODEL_NAME_FAST,
+                messages=[
                     {"role": "system", "content": system_msg},
                     {"role": "user", "content": user_msg},
                 ],
                 temperature=0.1,
-                max_tokens=25,
+                max_tokens=25, 
             )
             
             content = resp.choices[0].message.content.strip()
