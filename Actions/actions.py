@@ -45,8 +45,11 @@ else:
     async_client = None
 
 # Model names
-MODEL_NAME_FAST = "cognitivecomputations/dolphin-2.9.1-llama-3-70b" 
-MODEL_NAME_REASONING = "cognitivecomputations/dolphin-2.9.1-llama-3-70b"
+MODEL_NAME_FAST = "Qwen/Qwen2.5-72B-Instruct"
+MODEL_NAME_REASONING = "Qwen/Qwen2.5-72B-Instruct"
+
+# Request controls
+REQUEST_TIMEOUT_SECONDS = 10.0
 
 # Prompt size controls (chars)
 TOTAL_PROMPT_CHAR_LIMIT = 32000
@@ -66,6 +69,27 @@ def _get_db_conn(db_path: str):
     with sqlite3.connect(db_path, timeout=10.0) as conn:
         conn.execute("PRAGMA journal_mode=WAL")
         yield conn
+
+async def _call_openai_chat_completion(
+    model: str,
+    messages: List[Dict[str, Any]],
+    *,
+    max_tokens: Optional[int] = None,
+    temperature: Optional[float] = None,
+) -> Any:
+    if not async_client:
+        raise RuntimeError("OpenAI client is not configured")
+
+    kwargs: Dict[str, Any] = {"model": model, "messages": messages}
+    if max_tokens is not None:
+        kwargs["max_tokens"] = max_tokens
+    if temperature is not None:
+        kwargs["temperature"] = temperature
+
+    return await asyncio.wait_for(
+        async_client.chat.completions.create(**kwargs),
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    )
 
 # Database functions
 def insert_user_message(db_path: str, user_id: str, message: str) -> None:
@@ -556,14 +580,14 @@ class ActionAnalyzeMessage(Action):
             user_msg_limit = TOTAL_PROMPT_CHAR_LIMIT - len(system_msg)
             user_msg = _apply_prior_history_limit(user_msg_template, prior_history_text, user_msg_limit)
             
-            resp = await async_client.chat.completions.create(
-                model=MODEL_NAME_REASONING,
-                messages=[
+            resp = await _call_openai_chat_completion(
+                MODEL_NAME_REASONING,
+                [
                     {"role": "system", "content": system_msg},
                     {"role": "user", "content": user_msg}
                 ],
                 temperature=0.1,
-                max_tokens=1500
+                max_tokens=1500,
             )
             
             content = resp.choices[0].message.content.strip()
@@ -604,9 +628,9 @@ class ActionAnalyzeMessage(Action):
         if not async_client:
             return {}
         try:
-            resp = await async_client.chat.completions.create(
-                model=MODEL_NAME_REASONING,
-                messages=[{"role": "user", "content": mech_prompt}],
+            resp = await _call_openai_chat_completion(
+                MODEL_NAME_REASONING,
+                [{"role": "user", "content": mech_prompt}],
                 temperature=0.1,
             )
             return _extract_json(resp.choices[0].message.content.strip())
@@ -617,9 +641,9 @@ class ActionAnalyzeMessage(Action):
         if not async_client:
             return {}
         try:
-            resp = await async_client.chat.completions.create(
-                model=MODEL_NAME_REASONING,
-                messages=[{"role": "user", "content": scansion_prompt}],
+            resp = await _call_openai_chat_completion(
+                MODEL_NAME_REASONING,
+                [{"role": "user", "content": scansion_prompt}],
                 temperature=0.1,
                 max_tokens=600,
             )
@@ -627,8 +651,17 @@ class ActionAnalyzeMessage(Action):
         except Exception:
             return {}
 
-    async def _get_responses_parallel_async(self, mech_prompt: str, scansion_prompt: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    async def _get_responses_parallel_async(
+        self,
+        mech_prompt: str,
+        scansion_prompt: str,
+        include_scansion: bool = True,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         try:
+            if not include_scansion:
+                data1 = await self._call_mech_api(mech_prompt)
+                return data1, {}
+
             data1, data2 = await asyncio.gather(
                 self._call_mech_api(mech_prompt),
                 self._call_scansion_api(scansion_prompt)
@@ -641,9 +674,9 @@ class ActionAnalyzeMessage(Action):
         if not async_client:
             return None
         try:
-            resp = await async_client.chat.completions.create(
-                model=MODEL_NAME_FAST,
-                messages=[{"role": "user", "content": prompt2b}],
+            resp = await _call_openai_chat_completion(
+                MODEL_NAME_FAST,
+                [{"role": "user", "content": prompt2b}],
                 temperature=0.1,
             )
             data2b = _extract_json(resp.choices[0].message.content.strip())
@@ -695,14 +728,18 @@ class ActionAnalyzeMessage(Action):
         # --- CONTEXT EXTRACTION ---
         user_turn_count, raw_history_text, last_bot_text = _extract_session_context(tracker)
 
-        # We can still safely fire off the background task to insert the new message
+        # ---------------------------------------------------------
+        # EXPERIMENT CORRECTION: 
+        # Store a reference to the task instead of firing and forgetting.
+        # ---------------------------------------------------------
+        insert_task = None
         if user_input:
             async def _safe_insert():
                 try:
                     await asyncio.to_thread(insert_user_message, DB_PATH, user_id, user_input)
                 except Exception:
                     pass
-            asyncio.create_task(_safe_insert())
+            insert_task = asyncio.create_task(_safe_insert())
         
         # --- EARLY EXIT: ROUTE TO INITIAL RESPONSE ---
         # We process this BEFORE performing the heavy database queries
@@ -716,6 +753,14 @@ class ActionAnalyzeMessage(Action):
             return []
             
         # --- DATABASE QUERIES ---
+        # ---------------------------------------------------------
+        # EXPERIMENT CORRECTION:
+        # Enforce sequential execution. Await the write operation before 
+        # querying the database to eliminate race conditions.
+        # ---------------------------------------------------------
+        if insert_task:
+            await insert_task
+
         # These will now only execute on turn 4 and beyond, saving resources
         prior_history_messages, master_signifiers = await asyncio.gather(
             asyncio.to_thread(get_prior_history_messages, DB_PATH, user_id, 800),
@@ -777,7 +822,12 @@ class ActionAnalyzeMessage(Action):
 
         # ==== PASS 1 & 2a: PARALLEL CALLS FOR SPEED ===#
         prompt2a = build_cut_detection_prompt(user_input, raw_history_text, prior_history, master_signifier_history)
-        data1, data2 = await self._get_responses_parallel_async(mech_prompt, prompt2a)
+        include_scansion = user_turn_count >= 7
+        data1, data2 = await self._get_responses_parallel_async(
+            mech_prompt,
+            prompt2a,
+            include_scansion=include_scansion,
+        )
 
         mech: Optional[str] = data1.get("mechanism")
         mech_phrase: Optional[str] = data1.get("mechanism_phrase")
@@ -913,11 +963,11 @@ class ActionAnalyzeMessage(Action):
         if not async_client:
             return "..."
         try:
-            resp = await async_client.chat.completions.create(
-                model=MODEL_NAME_FAST,
-                messages=[{"role": "user", "content": prompt}],
+            resp = await _call_openai_chat_completion(
+                MODEL_NAME_FAST,
+                [{"role": "user", "content": prompt}],
                 temperature=0.8,
-                max_tokens=100
+                max_tokens=100,
             )
             
             response_text = resp.choices[0].message.content.strip().replace('\n', ' ')
@@ -1043,14 +1093,14 @@ class ActionAnalyzeMessage(Action):
         user_msg = user_msg_template
 
         try:
-            resp = await async_client.chat.completions.create(
-                model=MODEL_NAME_REASONING,
-                messages=[
+            resp = await _call_openai_chat_completion(
+                MODEL_NAME_REASONING,
+                [
                     {"role": "system", "content": system_msg},
                     {"role": "user", "content": user_msg},
                 ],
                 temperature=0.2,
-                max_tokens=25, 
+                max_tokens=25,
             )
             
             content = resp.choices[0].message.content.strip()
@@ -1153,14 +1203,14 @@ class ActionAnalyzeMessage(Action):
         user_msg = _apply_prior_history_limit(user_msg_template, prior_history, user_msg_limit)
         
         try:
-            resp = await async_client.chat.completions.create(
-                model=MODEL_NAME_FAST,
-                messages=[
+            resp = await _call_openai_chat_completion(
+                MODEL_NAME_FAST,
+                [
                     {"role": "system", "content": system_msg},
                     {"role": "user", "content": user_msg},
                 ],
                 max_tokens=20,
-                temperature=0.4, 
+                temperature=0.4,
             )
             
             line = resp.choices[0].message.content.strip()
@@ -1196,9 +1246,9 @@ class ActionAnalyzeMessage(Action):
     
     async def _gpt_identification_intervention_async(self, system_msg: str, user_msg: str) -> str:
         try:
-            resp = await async_client.chat.completions.create(
-                model=MODEL_NAME_FAST,
-                messages=[
+            resp = await _call_openai_chat_completion(
+                MODEL_NAME_FAST,
+                [
                     {"role": "system", "content": system_msg},
                     {"role": "user", "content": user_msg},
                 ],
@@ -1228,9 +1278,9 @@ class ActionAnalyzeMessage(Action):
         )
         user_msg = f"User text: \"{user_input}\""
         try:
-            resp = await async_client.chat.completions.create(
-                model=MODEL_NAME_FAST,
-                messages=[
+            resp = await _call_openai_chat_completion(
+                MODEL_NAME_FAST,
+                [
                     {"role": "system", "content": system_msg},
                     {"role": "user", "content": user_msg},
                 ],
@@ -1277,9 +1327,9 @@ class ActionAnalyzeMessage(Action):
     
     async def _gpt_denial_intervention_async(self, system_msg: str, user_msg: str) -> str:
         try:
-            resp = await async_client.chat.completions.create(
-                model=MODEL_NAME_FAST,
-                messages=[
+            resp = await _call_openai_chat_completion(
+                MODEL_NAME_FAST,
+                [
                     {"role": "system", "content": system_msg},
                     {"role": "user", "content": user_msg},
                 ],
@@ -1325,13 +1375,13 @@ class ActionAnalyzeMessage(Action):
         user_prompt = _apply_prior_history_limit(user_prompt_template, prior_history, user_prompt_limit)
 
         try:
-            response = await async_client.chat.completions.create(
-                model=MODEL_NAME_REASONING,
-                messages=[
+            response = await _call_openai_chat_completion(
+                MODEL_NAME_REASONING,
+                [
                     {"role": "system", "content": system_msg},
                     {"role": "user", "content": user_prompt},
                 ],
-                temperature=0.4, 
+                temperature=0.4,
                 max_tokens=15,
             )
             
@@ -1374,11 +1424,11 @@ class ActionAnalyzeMessage(Action):
         ) + f'"{user_input}"\n\nReturn only the single, capitalized signifier with a question mark:'
         
         try:
-            resp = await async_client.chat.completions.create(
-                model=MODEL_NAME_REASONING,
-                messages=[{"role": "user", "content": prompt}],
+            resp = await _call_openai_chat_completion(
+                MODEL_NAME_REASONING,
+                [{"role": "user", "content": prompt}],
                 max_tokens=10,
-                temperature=0.1, 
+                temperature=0.1,
             )
             line = _strip_response(resp.choices[0].message.content)
             line = re.sub(r"[^\w\s-]", "", line, flags=re.UNICODE).strip()
@@ -1409,9 +1459,9 @@ class ActionAnalyzeMessage(Action):
         )
         
         try:
-            resp = await async_client.chat.completions.create(
-                model=MODEL_NAME_FAST,
-                messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
+            resp = await _call_openai_chat_completion(
+                MODEL_NAME_FAST,
+                [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
                 max_tokens=100,
                 temperature=0.5,
             )
@@ -1441,9 +1491,9 @@ class ActionAnalyzeMessage(Action):
         )
         
         try:
-            resp = await async_client.chat.completions.create(
-                model=MODEL_NAME_REASONING,
-                messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
+            resp = await _call_openai_chat_completion(
+                MODEL_NAME_REASONING,
+                [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
                 max_tokens=20,
                 temperature=0.4,
             )
@@ -1472,9 +1522,9 @@ class ActionAnalyzeMessage(Action):
         )
         
         try:
-            resp = await async_client.chat.completions.create(
-                model=MODEL_NAME_REASONING,
-                messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
+            resp = await _call_openai_chat_completion(
+                MODEL_NAME_REASONING,
+                [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
                 max_tokens=30,
                 temperature=0.3,
             )
@@ -1517,9 +1567,9 @@ class ActionAnalyzeMessage(Action):
         )
         
         try:
-            resp = await async_client.chat.completions.create(
-                model=MODEL_NAME_FAST,
-                messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
+            resp = await _call_openai_chat_completion(
+                MODEL_NAME_FAST,
+                [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
                 max_tokens=10,
                 temperature=0.1,
             )
@@ -1546,14 +1596,14 @@ class ActionAnalyzeMessage(Action):
         user_msg = f"User Phrase containing the slip: \"{mechanism_phrase}\"\n\nOutput the JSON Slip:"
 
         try:
-            resp = await async_client.chat.completions.create(
-                model=MODEL_NAME_FAST,
-                messages=[
+            resp = await _call_openai_chat_completion(
+                MODEL_NAME_FAST,
+                [
                     {"role": "system", "content": system_msg},
                     {"role": "user", "content": user_msg},
                 ],
                 temperature=0.1,
-                max_tokens=25, 
+                max_tokens=25,
             )
             
             content = resp.choices[0].message.content.strip()
