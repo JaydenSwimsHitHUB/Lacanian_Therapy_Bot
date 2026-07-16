@@ -33,6 +33,6 @@ primary_region = "ams"
     hard_limit = 25
 
 [[vm]]
-  memory = "2gb"
-  cpu_kind = "shared"
-  cpus = 1
+  memory = "4gb"
+  cpu_kind = "performance"
+  cpus = 2

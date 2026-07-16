@@ -1,7 +1,6 @@
 import asyncio
 import datetime
 import json
-import logging
 import os
 import random
 import re
@@ -50,9 +49,6 @@ def _decrypt(text: str) -> str:
 api_key = os.getenv("OPENAI_API_KEY")
 base_url = os.getenv("API_BASE_URL", "https://api.deepinfra.com/v1/openai")
 llm_timeout = float(os.getenv("LLM_REQUEST_TIMEOUT", "90"))
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-logging.basicConfig(level=logging.INFO)
 
 if api_key:
     async_client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=llm_timeout)
@@ -123,7 +119,6 @@ def clear_user_master_signifiers_before(db_path: str, user_id: str, timestamp: s
         cursor = conn.execute("DELETE FROM master_signifiers WHERE user_id = ? AND timestamp <= ?", (user_id, timestamp))
         deleted_count = cursor.rowcount
         conn.commit()
-        logger.info("Cleared %d master signifier rows for user %s before %s", deleted_count, user_id, timestamp)
         return deleted_count
 
 def _insert_master_signifiers(db_path: str, user_id: str, s1_list: list) -> None:
@@ -150,9 +145,6 @@ def _insert_master_signifiers(db_path: str, user_id: str, s1_list: list) -> None
         if valid_items:
             conn.executemany(query, valid_items)
             conn.commit()
-            logger.info("Inserted %d master signifier(s) for user %s", len(valid_items), user_id)
-        else:
-            logger.info("No valid master signifier(s) to insert for user %s", user_id)
 
 # --- LOCKOUT DATABASE FUNCTIONS ---
 def set_user_lockout(db_path: str, user_id: str, hours: int = 48, base_time: Optional[float] = None) -> None:
@@ -692,10 +684,8 @@ class ActionAnalyzeMessage(Action):
             new_s1s = data.get("new_s1s")
             
             if isinstance(new_s1s, list):
-                logger.info("Candidate master signifiers for user %s: %s", user_id, json.dumps(new_s1s[:5], ensure_ascii=False))
                 await asyncio.to_thread(clear_user_master_signifiers_before, DB_PATH, user_id, session_start_time)
                 await asyncio.to_thread(_insert_master_signifiers, DB_PATH, user_id, new_s1s[:5])
-                logger.info("Completed master signifier refresh for user %s from prior history at %s", user_id, session_start_time)
         except Exception:
             pass
 
@@ -717,7 +707,6 @@ class ActionAnalyzeMessage(Action):
 
         cnt = int(counts.get(mechanism, 0)) + 1
         counts[mechanism] = cnt
-        logger.info("Mechanism '%s' updated: count=%d; counts=%r", mechanism, cnt, counts)
         return counts, cnt
 
     async def _call_combined_analysis_api(self, prompt: str) -> Dict[str, Any]:
@@ -731,7 +720,6 @@ class ActionAnalyzeMessage(Action):
                 max_tokens=500,
             )
             content = resp.choices[0].message.content.strip()
-            logger.info("--- INCOMING COMBINED ANALYSIS RESPONSE ---\n%s", content)
             return _extract_json(content)
         except Exception:
             return {}
@@ -747,7 +735,6 @@ class ActionAnalyzeMessage(Action):
                 max_tokens=300,
             )
             content = resp.choices[0].message.content.strip()
-            logger.info("--- INCOMING CUT CONSTRUCTION RESPONSE ---\n%s", content)
             data2b = _extract_json(content)
             cut_phrase = data2b.get("cut_phrase")
             if cut_phrase and isinstance(cut_phrase, str) and cut_phrase:
@@ -835,8 +822,6 @@ class ActionAnalyzeMessage(Action):
         user_words = user_input_lower.split()
 
         master_signifiers_sorted = sorted(master_signifiers, key=len, reverse=True)
-        
-        logger.info("Active Master Signifiers for user %s: %s", user_id, master_signifiers_sorted)
         
         mech_res, detected_s1, mech_phrase_res, shifted_boundary_data = await asyncio.to_thread(
             _scan_for_master_signifier,
@@ -983,7 +968,6 @@ class ActionAnalyzeMessage(Action):
             )
             
             raw_content = resp.choices[0].message.content
-            logger.info("--- INCOMING INITIAL RESPONSE RAW ---\n%r", raw_content)
             response_text = raw_content.strip().replace('\n', ' ')
             
             if not re.search(r'[.!?]$', response_text):
