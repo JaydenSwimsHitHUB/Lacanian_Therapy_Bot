@@ -4,7 +4,7 @@ import threading
 import os
 import sys
 
-IDLE_TIMEOUT = 2350.0  # 30 minutes in seconds
+IDLE_TIMEOUT = 300.0  # 30 minutes in seconds
 last_activity = time.time()
 state_lock = threading.Lock()
 
@@ -32,6 +32,7 @@ def run_server():
     global last_activity
     
     command = [
+        "stdbuf", "-oL", "-eL",  # force line-buffering on the child's stdout/stderr at the OS level
         "rasa", "run", 
         "--enable-api", 
         "--cors", "*", 
@@ -39,13 +40,20 @@ def run_server():
         "--interface", "0.0.0.0"
     ]
     
-    # Launch Rasa as a child process, capturing stdout and stderr combined
+    # Launch Rasa as a child process, capturing stdout and stderr combined.
+    # PYTHONUNBUFFERED=1 additionally forces the Python interpreter itself to
+    # skip its default block-buffering when stdout is a pipe (not a TTY), so
+    # log lines like "Received user message" reach us immediately instead of
+    # sitting in an internal buffer until it fills up or the process exits.
+    child_env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+
     proc = subprocess.Popen(
         command, 
         stdout=subprocess.PIPE, 
         stderr=subprocess.STDOUT, 
         text=True,
-        bufsize=1
+        bufsize=1,
+        env=child_env
     )
     
     # Initialize the independent watchdog thread

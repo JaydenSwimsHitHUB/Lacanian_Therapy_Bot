@@ -12,11 +12,10 @@ USER root
 # Ensure Protobuf version is compatible with TensorFlow 2.11.1
 RUN pip install "protobuf==3.19.6"
 
-# Install project-specific dependencies (including nltk)
-RUN if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+# Install project-specific dependencies
+RUN if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; fi
 
-# Download the spaCy English language model
-RUN python -m spacy download en_core_web_sm
+RUN python -c "import nltk; nltk.download('averaged_perceptron_tagger_eng'); nltk.download('cmudict')"
 
 # Force Python implementation of Protobuf to avoid runtime conflicts
 ENV PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
@@ -33,5 +32,5 @@ USER rasa
 # Expose action server port
 EXPOSE 5055
 
-# inherits ENTRYPOINT ["rasa"] from the base image
+# Inherits ENTRYPOINT ["rasa"] from the base image
 CMD ["run", "actions", "--port", "5055", "--debug"]

@@ -8,12 +8,12 @@ import re
 import sqlite3
 import time
 from contextlib import contextmanager
+from functools import lru_cache
 from typing import Any, Dict, List, Optional, Text, Tuple
 
 # --- THIRD-PARTY IMPORTS ---
 from cryptography.fernet import Fernet, InvalidToken
-import eng_to_ipa as ipa
-import jellyfish
+from g2p_en import G2p
 from openai import AsyncOpenAI
 from rasa_sdk import Action, Tracker
 from rasa_sdk.events import (
@@ -25,15 +25,9 @@ from rasa_sdk.events import (
 )
 from rasa_sdk.executor import CollectingDispatcher
 
-# --- CONDITIONAL THIRD-PARTY IMPORTS ---
-try:
-    import spacy
-    from spacy.lang.en.stop_words import STOP_WORDS
-    nlp = spacy.load("en_core_web_sm")
-except (ImportError, OSError):
-    nlp = None
-    STOP_WORDS = set()
-    logging.warning("spaCy or en_core_web_sm not found. Lemmatization and stop-word filtering will be bypassed.")
+# --- STATIC STOP WORDS ---
+# A lightweight set to prevent basic articles and pronouns from triggering false positive homophones.
+STOP_WORDS = {"a", "an", "the", "and", "but", "or", "on", "in", "with", "is", "was", "to", "for", "it", "of", "my", "i"}
 
 # --- SETUP ENCRYPTION ---
 ENCRYPTION_KEY = os.getenv("CHAT_ENCRYPTION_KEY")
@@ -74,7 +68,7 @@ TOTAL_PROMPT_CHAR_LIMIT = int(os.getenv("TOTAL_PROMPT_CHAR_LIMIT", "12000"))
 PRIOR_HISTORY_PROMPT_LIMIT = int(os.getenv("PRIOR_HISTORY_PROMPT_LIMIT", "100"))
 PRIOR_HISTORY_TOKEN = "__PRIOR_HISTORY__"
 TRUNCATION_MARKER = "...(truncated)\n"
-PRIOR_HISTORY_ENABLED = False
+PRIOR_HISTORY_ENABLED = True
 
 # --- HISTORY / DB SETUP ---
 DB_PATH = os.getenv("CHAT_DB_PATH", "/app/persistent/chat_history.db")
@@ -85,7 +79,6 @@ if dir_path:
 @contextmanager
 def _get_db_conn(db_path: str):
     with sqlite3.connect(db_path, timeout=10.0) as conn:
-        conn.execute("PRAGMA journal_mode=WAL")
         yield conn
 
 def insert_user_message(db_path: str, user_id: str, message: str) -> None:
@@ -162,16 +155,28 @@ def _insert_master_signifiers(db_path: str, user_id: str, s1_list: list) -> None
             logger.info("No valid master signifier(s) to insert for user %s", user_id)
 
 # --- LOCKOUT DATABASE FUNCTIONS ---
-def clear_user_lockout(db_path: str, user_id: str) -> None:
+def set_user_lockout(db_path: str, user_id: str, hours: int = 48, base_time: Optional[float] = None) -> None:
+    if base_time is None:
+        base_time = time.time()
+    lockout_until = base_time + (hours * 3600)
     with _get_db_conn(db_path) as conn:
-        conn.execute("DELETE FROM user_lockouts WHERE user_id = ?", (user_id,))
+        conn.execute(
+            "INSERT OR REPLACE INTO user_lockouts (user_id, lockout_until) VALUES (?, ?)",
+            (user_id, lockout_until)
+        )
         conn.commit()
 
-def set_user_lockout(db_path: str, user_id: str, hours: int = 48, base_time: Optional[float] = None) -> None:
-    return None
-
 def is_user_locked_out(db_path: str, user_id: str) -> bool:
-    return False
+    with _get_db_conn(db_path) as conn:
+        cursor = conn.execute("SELECT lockout_until FROM user_lockouts WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+        if row:
+            if time.time() < row[0]:
+                return True
+            else:
+                conn.execute("DELETE FROM user_lockouts WHERE user_id = ?", (user_id,))
+                conn.commit()
+        return False
 
 # --- UTILITY HELPERS ---
 def _strip_response(text: str) -> str:
@@ -225,6 +230,99 @@ def _extract_json(content: str) -> Dict[str, Any]:
             return {}
     return {}
 
+# --- G2P PHONETIC ARCHITECTURE ---
+g2p = G2p()
+
+@lru_cache(maxsize=2048)
+def _get_phonemes(text: str) -> List[str]:
+    """Translates text to ARPAbet phonemes and strips stress markers."""
+    if not text:
+        return []
+    raw_phonemes = g2p(text)
+    return [p.strip('012') for p in raw_phonemes if p.strip() and p.isalnum()]
+
+def _phoneme_edit_distance(l1: List[str], l2: List[str]) -> int:
+    """Calculates Levenshtein distance cleanly on string arrays to avoid C-extension hacks."""
+    m, n = len(l1), len(l2)
+    dp = [[0] * (n + 1) for _ in range(m + 1)]
+    for i in range(m + 1): 
+        dp[i][0] = i
+    for j in range(n + 1): 
+        dp[0][j] = j
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            cost = 0 if l1[i-1] == l2[j-1] else 1
+            dp[i][j] = min(dp[i-1][j] + 1, dp[i][j-1] + 1, dp[i-1][j-1] + cost)
+    return dp[m][n]
+
+def _check_phoneme_sub_array(chunk_phonemes: List[str], s1_phonemes: List[str]) -> bool:
+    """Checks if the contiguous S1 phoneme sequence exists within a larger chunk."""
+    if not s1_phonemes or not chunk_phonemes:
+        return False
+    s1_len = len(s1_phonemes)
+    for i in range(len(chunk_phonemes) - s1_len + 1):
+        if chunk_phonemes[i:i+s1_len] == s1_phonemes:
+            return True
+    return False
+
+def _is_acoustic_homophone(chunk_phonemes: List[str], s1_phonemes: List[str]) -> bool:
+    """Applies the proportional Levenshtein edit distance logic to phoneme arrays."""
+    if not s1_phonemes or not chunk_phonemes:
+        return False
+    dist = _phoneme_edit_distance(chunk_phonemes, s1_phonemes)
+    if len(s1_phonemes) < 4:
+        return dist == 0
+    return dist == 0
+
+def _scan_for_master_signifier(user_input_lower: str, user_words: List[str], master_signifiers_sorted: List[str]) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[Dict[str, str]]]:
+    s1_phonemes_map = {s1: _get_phonemes(s1) for s1 in master_signifiers_sorted}
+    
+    for s1 in master_signifiers_sorted:
+        if not s1.strip():
+            continue
+            
+        s1_lower = s1.lower()
+        s1_ph = s1_phonemes_map[s1]
+        if not s1_ph:
+            continue
+            
+        # STEP 1: Single-Word Analysis (Catches exact, morphological, and internal hidden sounds)
+        for word in user_words:
+            word_ph = _get_phonemes(word)
+            
+            # Condition A: Hidden phonetic sound inside a larger word (e.g., S1 "sun" inside "asunder")
+            if _check_phoneme_sub_array(word_ph, s1_ph):
+                if word == s1_lower or _is_acoustic_homophone(word_ph, s1_ph):
+                    return "master_signifier", word, word, None
+                return "master_signifier", s1_lower, s1_lower, {"chunk": word, "s1": s1_lower}
+                
+            # Condition B: Direct morphological variant or homophone (e.g., "sun" vs "son" vs "suns")
+            if _is_acoustic_homophone(word_ph, s1_ph):
+                # Reject meaningless stopword homophones (unless it IS the S1)
+                if word in STOP_WORDS and word != s1_lower:
+                    continue
+                return "master_signifier", word, word, None
+
+        # STEP 2: Cross-Boundary Analysis (Sliding Window 2-4 words)
+        max_window = min(4, len(user_words))
+        for window_size in range(2, max_window + 1):
+            for i in range(len(user_words) - window_size + 1):
+                chunk_list = user_words[i:i + window_size]
+                
+                # Join with spaces to preserve G2P dictionary inference
+                chunk_str = " ".join(chunk_list)
+                chunk_ph = _get_phonemes(chunk_str)
+                
+                # Condition C: Hidden sound bridging two words (e.g., S1 "ice" in "my son" -> M AY S AH N)
+                if _check_phoneme_sub_array(chunk_ph, s1_ph):
+                    return "master_signifier", s1_lower, s1_lower, {"chunk": chunk_str, "s1": s1_lower}
+                    
+                # Condition D: Phrase-level homophones
+                if _is_acoustic_homophone(chunk_ph, s1_ph):
+                    return "master_signifier", chunk_str, chunk_str, None
+
+    return None, None, None, None
+
 # ---------------------------
 
 INTERJECTION_CHOICES = ["Ah?", "Oh?", "Elaborate?", "Say more?", "Mhmm?"]
@@ -242,8 +340,7 @@ response_matrix: Dict[str, Dict[int, Optional[str]]] = {
     "metonymy": {1: "<gpt_metonymy>", 2: "<gpt_metonymy>", 3: "<oracle>", 5: "<gpt_metonymy>"}, 
     "ambiguity": {1: "<gpt_ambiguity>", 2: "<gpt_ambiguity>", 3: "<oracle>"}, 
     "fetishistic_phrase": {1: "...", 2: "<oracle>"},
-    "identification_other_desire": {1: "<gpt_identification>", 2: "<random_interjection>", 3: "<oracle>", 5: "<gpt_metonymy>"}, 
-    "demand_for_knowledge": {1: "...", 2: "Hmm.", 3: "<oracle>", 4: "<gpt_desire_question>", 5: "<gpt_metonymy>"},
+    "identification_other_desire": {1: "<gpt_identification>", 2: "<random_interjection>", 3: "<oracle>", 5: "<gpt_metonymy>"},
     "confession_empathy": {1: "...", 2: "Hmm.", 3: "<oracle>", 4: "<gpt_desire_question>", 5: "<oracle>"},
     "frame_protection": {1: "...", 2: "Hmm.", 3: "<oracle>"},
     "dream_report": {1: "<gpt_dream_question>", 2: "<gpt_metonymy>", 3: "<oracle>"},
@@ -345,11 +442,10 @@ MECHANISM_DEFINITIONS = (
     "- jouissance: The paradox where the subject derives satisfaction from a symptom that is consciously painful or unpleasant. Do not look for 'happiness' but for the Drive (the loop). At least three of the following criteria must be met for you to select this mechanism: (1) Repetition ('I keep doing it', 'again and again'); (2) Paradox ('I hate it but I can't stop', 'awful but I need it'); (3) Excess ('overwhelming', 'too much', 'unbearable'); (4) The Body (physical symptoms, vomiting, shaking) alongside painful, excessive emotion; (5) Fixation on a partial object.\n"
     "- ambiguity: Indeterminate referents.\n"
     "- fetishistic_phrase: Clichés that halt the exploration of desire(s). Common phrases that are impersonal and formulaic.\n"
-    "- demand_for_knowledge: Demand(s) for knowledge and inquiries leveled at you.\n"
     "- confession_empathy: Seeking rescue or closeness.\n"
     "- dream_report: The user recounts a dream, nightmare, or a fragment of a dream.\n"
     "- frame_protection: Demands for the session to end.\n"
-    "- stasis: The user is stuck, stops associating, expresses an inability to continue, or responds with silence (...) or gibberish.\n"
+    "- stasis: The user is stuck, shows resistence, or responds with silence (...) or gibberish.\n"
     "- unfinished_thought: The user expresses an idea that is incomplete, trailing off, or self-interrupted.\n"
     "- transference_lure: The user focuses on you (the analyst), makes demands of you, projects feelings onto you, or attempts to draw you into an Imaginary interpersonal dynamic.\n"
     "- parapraxis: A slip of the tongue, a spoonerism, a misreading, an utterance that the user 'did not mean to say' or any such error that reveals an unconscious signifier. Include instances where a signifier feels 'out of place' or originates from a distant embedding space.\n"
@@ -432,19 +528,6 @@ Respond ONLY in this strict JSON format:
 }}
 """
 
-def _is_true_phonetic_match(chunk: str, s1: str) -> bool:
-    """
-    Translates strings to IPA and checks if the S1 is a true acoustic substring.
-    """
-    chunk_ipa = ipa.convert(chunk).replace("ˈ", "").replace("ˌ", "").replace(" ", "").replace("*", "")
-    s1_ipa = ipa.convert(s1).replace("ˈ", "").replace("ˌ", "").replace(" ", "").replace("*", "")
-    
-    # If the IPA translation fails (returns empty), we default to True to let the LLM decide
-    if not chunk_ipa or not s1_ipa:
-        return False
-        
-    return s1_ipa in chunk_ipa
-
 # ---------- Actions ----------
 class ActionSessionStartCustom(Action):
     def name(self) -> Text:
@@ -459,7 +542,6 @@ class ActionSessionStartCustom(Action):
         
         start_time = time.time()
         user_id = tracker.sender_id
-        await asyncio.to_thread(clear_user_lockout, DB_PATH, user_id)
         
         return [
             SessionStarted(),
@@ -490,7 +572,6 @@ class ActionExecuteTimeout(Action):
         if is_locked:
             return []
 
-        # We now use the helper function to merge the entries with the hidden zero-width space
         session_end_message = _format_two_paragraph_message(
             "Our session time is up, to push further would encourage over-analysis.",
             "I will talk with you again after 48 hours."
@@ -505,7 +586,8 @@ class ActionExecuteTimeout(Action):
 
 class ActionAnalyzeMessage(Action):
     def __init__(self):
-        with _get_db_conn(DB_PATH) as conn:
+        with sqlite3.connect(DB_PATH, timeout=10.0) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS master_signifiers (
@@ -528,7 +610,7 @@ class ActionAnalyzeMessage(Action):
             conn.commit()
 
         self.idle_task = None
-        self.idle_timeout = 600.0  
+        self.idle_timeout = 1800.0  
 
     def name(self) -> Text:
         return "action_analyze_message"
@@ -748,125 +830,27 @@ class ActionAnalyzeMessage(Action):
 
         mech: Optional[str] = data.get("mechanism")
         mech_phrase: Optional[str] = data.get("mechanism_phrase")
-        
-# --- MECHANICAL OVERRIDE FOR MASTER SIGNIFIER (NLP & PHONETICS) ---
-        detected_s1: Optional[str] = None
-        shifted_boundary_data: Optional[Dict[str, str]] = None
+
         user_input_lower = user_input.lower()
-        
-        user_lemmas = []
-        user_words = []
-        
-        if nlp:
-            doc = nlp(user_input_lower)
-            user_lemmas = [token.lemma_ for token in doc]
-            user_words = [token.text for token in doc]
-        else:
-            user_words = user_input_lower.split()
+        user_words = user_input_lower.split()
 
         master_signifiers_sorted = sorted(master_signifiers, key=len, reverse=True)
         
         logger.info("Active Master Signifiers for user %s: %s", user_id, master_signifiers_sorted)
         
-        for s1 in master_signifiers_sorted:
-            if not s1.strip():
-                continue
-            s1_lower = s1.lower()
-            
-            match_found = False
-            
-            # 1 & 3A. Unified Exact & Cross-Boundary Substring Match
-            pattern = r'\s*'.join(re.escape(ch) for ch in s1_lower)
-            for match in re.finditer(pattern, user_input_lower):
-                matched_str = match.group(0)
-                
-                # Identify the character boundaries of the enclosing words
-                start_idx = match.start()
-                word_start = start_idx
-                while word_start > 0 and user_input_lower[word_start - 1].isalnum():
-                    word_start -= 1
-                    
-                word_end = start_idx + len(matched_str)
-                while word_end < len(user_input_lower) and user_input_lower[word_end].isalnum():
-                    word_end += 1
-                    
-                enclosing_chunk = user_input_lower[word_start:word_end].strip()
-                
-                # Condition 1: Match spans a word boundary (contains a space). Valid!
-                if " " in matched_str:
-                    # NEW: Mechanical IPA acoustic verification
-                    if _is_true_phonetic_match(enclosing_chunk, s1_lower):
-                        match_found = True
-                        shifted_boundary_data = {"chunk": enclosing_chunk, "s1": s1_lower}
-                        break
-                    
-                # Condition 2: Match is contiguous. We verify its enclosing word.
-                if enclosing_chunk not in STOP_WORDS or enclosing_chunk == s1_lower:
-                    # NEW: Mechanical IPA acoustic verification for hidden words
-                    if enclosing_chunk == s1_lower or _is_true_phonetic_match(enclosing_chunk, s1_lower):
-                        match_found = True
-                        if enclosing_chunk != s1_lower:
-                            shifted_boundary_data = {"chunk": enclosing_chunk, "s1": s1_lower}
-                        break
-            
-            # 2. Lemmatization Match
-            if not match_found and nlp:
-                s1_doc = nlp(s1_lower)
-                s1_lemma_str = " ".join([token.lemma_ for token in s1_doc])
-                user_lemma_str = " ".join(user_lemmas)
-                
-                if s1_lemma_str and s1_lemma_str in user_lemma_str:
-                    # Ensure lemma match itself isn't trapped inside a stopword
-                    if s1_lemma_str not in STOP_WORDS or s1_lemma_str == s1_lower:
-                        match_found = True
-            
-            # 2B. Pure IPA Phonetic Inclusion (Homophones within words)
-            if not match_found:
-                s1_ipa_clean = ipa.convert(s1_lower).replace("ˈ", "").replace("ˌ", "").replace(" ", "").replace("*", "")
-                
-                if s1_ipa_clean: # Only proceed if the S1 exists in the IPA dictionary
-                    for word in user_words:
-                        word_ipa_clean = ipa.convert(word).replace("ˈ", "").replace("ˌ", "").replace(" ", "").replace("*", "")
-                        
-                        # If the dictionary translated the word, and the S1 sound is inside it
-                        if word_ipa_clean and s1_ipa_clean in word_ipa_clean:
-                            # Ensure the harboring word isn't a meaningless stopword
-                            if word not in STOP_WORDS or word == s1_lower:
-                                match_found = True
-                                if word != s1_lower:
-                                    shifted_boundary_data = {"chunk": word, "s1": s1_lower}
-                                break
+        mech_res, detected_s1, mech_phrase_res, shifted_boundary_data = await asyncio.to_thread(
+            _scan_for_master_signifier,
+            user_input_lower,
+            user_words,
+            master_signifiers_sorted
+        )
 
-            # 3B. Phonetic Homophone Match
-            if not match_found:
-                s1_phone = jellyfish.metaphone(s1_lower)
-                max_window = min(4, len(user_words))
-                
-                for window_size in range(1, max_window + 1):
-                    for i in range(len(user_words) - window_size + 1):
-                        chunk = user_words[i:i + window_size]
-                        merged_chunk = "".join(chunk)
-                        
-                        chunk_phone = jellyfish.metaphone(merged_chunk)
-                        
-                        if s1_phone and s1_phone == chunk_phone:
-                            similarity = jellyfish.jaro_winkler_similarity(s1_lower, merged_chunk)
-                            if similarity >= 0.88: 
-                                # Reject if a single-word phonetic match is a stopword (and not the S1 itself)
-                                if window_size == 1:
-                                    word = chunk[0].lower()
-                                    if word in STOP_WORDS and word != s1_lower:
-                                        continue 
-                                match_found = True
-                                break
-                    if match_found:
-                        break
-
-            if match_found:
-                mech = "master_signifier"
-                detected_s1 = s1.strip()
-                mech_phrase = detected_s1
-                break
+        if mech_res:
+            mech = mech_res
+            mech_phrase = mech_phrase_res
+        else:
+            detected_s1 = None
+            shifted_boundary_data = None
 
         # ==== PASS 2: Potential Cut Trigger Identification ===#
         potential_trigger: Optional[str] = data.get("cut_trigger")
@@ -914,7 +898,6 @@ class ActionAnalyzeMessage(Action):
             counts, cnt = self._update_mechanism_counts(tracker, mech, detected_s1)
             dream_asked = tracker.get_slot("dream_fantasy_asked") or False
             
-            # OVERRIDE: Route to the dynamic shifted boundary prompt if fragments exist
             if mech == "master_signifier" and shifted_boundary_data:
                 text = await self._gpt_shifted_boundary_intervention(
                     shifted_boundary_data["chunk"], 
@@ -1640,17 +1623,11 @@ class ActionAnalyzeMessage(Action):
         # PROMPT UPDATED: Only appended new words to the first sentence and the examples list.
         system_msg = (
             "You are Bruce Fink. The user unconsciously produced a Master Signifier (S1) hidden across a word boundary or within a single larger word.\n"
-            "Your task is to formulate a short, enigmatic, oracular echo or question that highlights this phonetic collision.\n\n"
+            "Your task is to formulate a 2 to 3 word, polyvalent, 'trippy', oracular echo that highlights this phonetic amalgamation.\n\n"
             "Rules:\n"
-            "1. DO NOT explain the mechanism or provide context. Never say 'Notice how...'\n"
-            "2. Exclusively use the provided host words and the hidden S1 to construct the intervention.\n"
-            "3. Format it as a jarring punctuation, an oracular interpretation or a humorous question.\n"
-            "4. Maximum 10 words.\n\n"
-            "Examples:\n"
-            "- Host: 'bigger until', S1: 'run' -> Output: 'Bigger run 'til?'\n"
-            "- Host: 'a loan', S1: 'alone' -> Output: 'A loan... alone?'\n"
-            "- Host: 'car app', S1: 'rap' -> Output: 'Car app... ca...rap?'\n"
-            "- Host: 'Crocodile', S1: 'dial' -> Output: 'Crocodile...OH! DIAL!'"
+            "1. Exclusively use the provided host words and the hidden S1 to construct the intervention.\n"
+            "2. Maximum 3 words.\n"
+            "3. Capitalize the first word and end wih a period.\n\n"
         )
         
         user_msg = f"Host words: \"{chunk}\"\nHidden S1: \"{s1}\"\nProduce the intervention:"
@@ -1662,8 +1639,8 @@ class ActionAnalyzeMessage(Action):
                     {"role": "system", "content": system_msg},
                     {"role": "user", "content": user_msg},
                 ],
-                temperature=0.3,
-                max_tokens=20, 
+                temperature=0.5,
+                max_tokens=15, 
             )
             
             line = _strip_response(resp.choices[0].message.content)
