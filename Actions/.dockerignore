@@ -1,0 +1,16 @@
+# Virtual Environments
+.venv/
+
+# Python Bytecode and Cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Testing Caches
+.pytest_cache/
+
+# Docker and Meta Files
+Dockerfile
+.dockerignore
+README.md

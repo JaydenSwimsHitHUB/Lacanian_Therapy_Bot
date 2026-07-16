@@ -1,66 +1,80 @@
-import json
-import os
-import re
-import random
-import sqlite3
 import asyncio
 import datetime
+import json
+import logging
+import os
+import random
+import re
+import sqlite3
 import time
 from contextlib import contextmanager
-from typing import Any, Text, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Text, Tuple
 
+# --- THIRD-PARTY IMPORTS ---
 from cryptography.fernet import Fernet, InvalidToken
+import eng_to_ipa as ipa
+import jellyfish
 from openai import AsyncOpenAI
 from rasa_sdk import Action, Tracker
+from rasa_sdk.events import (
+    ActionExecuted,
+    EventType,
+    ReminderScheduled,
+    SessionStarted,
+    SlotSet,
+)
 from rasa_sdk.executor import CollectingDispatcher
-from rasa_sdk.events import SlotSet, SessionStarted, ActionExecuted, EventType, ReminderScheduled
+
+# --- CONDITIONAL THIRD-PARTY IMPORTS ---
+try:
+    import spacy
+    from spacy.lang.en.stop_words import STOP_WORDS
+    nlp = spacy.load("en_core_web_sm")
+except (ImportError, OSError):
+    nlp = None
+    STOP_WORDS = set()
+    logging.warning("spaCy or en_core_web_sm not found. Lemmatization and stop-word filtering will be bypassed.")
 
 # --- SETUP ENCRYPTION ---
-# The key must be a URL-safe base64-encoded 32-byte key provided via Fly.io secrets
 ENCRYPTION_KEY = os.getenv("CHAT_ENCRYPTION_KEY")
 cipher_suite = Fernet(ENCRYPTION_KEY.encode('utf-8')) if ENCRYPTION_KEY else None
 
 def _encrypt(text: str) -> str:
-    """Encrypts plaintext to a Fernet token string."""
     if not cipher_suite or not text:
         return text
     return cipher_suite.encrypt(text.encode('utf-8')).decode('utf-8')
 
 def _decrypt(text: str) -> str:
-    """Decrypts a Fernet token string back to plaintext. Falls back gracefully for legacy unencrypted data."""
     if not cipher_suite or not text:
         return text
     try:
         return cipher_suite.decrypt(text.encode('utf-8')).decode('utf-8')
     except InvalidToken:
-        return text  # Handles old, unencrypted database rows
+        return text 
 
 # --- SETUP CLIENT FOR DOLPHIN LLAMA ---
 api_key = os.getenv("OPENAI_API_KEY")
 base_url = os.getenv("API_BASE_URL", "https://api.deepinfra.com/v1/openai")
 llm_timeout = float(os.getenv("LLM_REQUEST_TIMEOUT", "90"))
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+logging.basicConfig(level=logging.INFO)
 
 if api_key:
     async_client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=llm_timeout)
 else:
     async_client = None
 
-# Fast model for rapport, JSON classification, and short interventions.
-# Reasoning model reserved for complex Lacanian generation (metonymy, oracle, S1 extraction).
 MODEL_NAME_FAST = os.getenv(
     "MODEL_NAME_FAST",
-    "meta-llama/Meta-Llama-3-8B-Instruct",
-)
-MODEL_NAME_REASONING = os.getenv(
-    "MODEL_NAME_REASONING",
-    "meta-llama/Meta-Llama-3-8B-Instruct",
+    "deepseek-ai/DeepSeek-V4-Flash",
 )
 
-# Prompt size controls (chars)
 TOTAL_PROMPT_CHAR_LIMIT = int(os.getenv("TOTAL_PROMPT_CHAR_LIMIT", "12000"))
 PRIOR_HISTORY_PROMPT_LIMIT = int(os.getenv("PRIOR_HISTORY_PROMPT_LIMIT", "100"))
 PRIOR_HISTORY_TOKEN = "__PRIOR_HISTORY__"
 TRUNCATION_MARKER = "...(truncated)\n"
+PRIOR_HISTORY_ENABLED = False
 
 # --- HISTORY / DB SETUP ---
 DB_PATH = os.getenv("CHAT_DB_PATH", "/app/persistent/chat_history.db")
@@ -68,15 +82,12 @@ dir_path = os.path.dirname(DB_PATH)
 if dir_path:
     os.makedirs(dir_path, exist_ok=True)
 
-# Database connection helper
 @contextmanager
 def _get_db_conn(db_path: str):
-    """Context manager for database connections with WAL mode."""
     with sqlite3.connect(db_path, timeout=10.0) as conn:
         conn.execute("PRAGMA journal_mode=WAL")
         yield conn
 
-# Database functions
 def insert_user_message(db_path: str, user_id: str, message: str) -> None:
     encrypted_message = _encrypt(message)
     with _get_db_conn(db_path) as conn:
@@ -119,6 +130,7 @@ def clear_user_master_signifiers_before(db_path: str, user_id: str, timestamp: s
         cursor = conn.execute("DELETE FROM master_signifiers WHERE user_id = ? AND timestamp <= ?", (user_id, timestamp))
         deleted_count = cursor.rowcount
         conn.commit()
+        logger.info("Cleared %d master signifier rows for user %s before %s", deleted_count, user_id, timestamp)
         return deleted_count
 
 def _insert_master_signifiers(db_path: str, user_id: str, s1_list: list) -> None:
@@ -145,36 +157,40 @@ def _insert_master_signifiers(db_path: str, user_id: str, s1_list: list) -> None
         if valid_items:
             conn.executemany(query, valid_items)
             conn.commit()
+            logger.info("Inserted %d master signifier(s) for user %s", len(valid_items), user_id)
+        else:
+            logger.info("No valid master signifier(s) to insert for user %s", user_id)
 
 # --- LOCKOUT DATABASE FUNCTIONS ---
 def clear_user_lockout(db_path: str, user_id: str) -> None:
-    """Removes any stored lockout for the given user."""
     with _get_db_conn(db_path) as conn:
         conn.execute("DELETE FROM user_lockouts WHERE user_id = ?", (user_id,))
         conn.commit()
 
 def set_user_lockout(db_path: str, user_id: str, hours: int = 48, base_time: Optional[float] = None) -> None:
-    """Disabled: user lockouts are intentionally not enforced."""
     return None
 
 def is_user_locked_out(db_path: str, user_id: str) -> bool:
-    """Disabled: always returns False so the user is never locked out."""
     return False
 
 # --- UTILITY HELPERS ---
 def _strip_response(text: str) -> str:
-    """Standardize response stripping: remove quotes and whitespace."""
     return text.strip().strip("\"'").strip()
 
 def _ensure_trailing_punct(text: str, punct: str = "?") -> str:
-    """Ensure text ends with specified punctuation."""
     if not text:
         return text
     if text.endswith(punct) or text.endswith("..."):
         return text
     return text.rstrip(" .") + punct
 
-# --- UTILITY: ROBUST JSON EXTRACTION ---
+def _format_two_paragraph_message(first_paragraph: str, second_paragraph: str) -> str:
+    first = re.sub(r"\s+", " ", (first_paragraph or "").strip())
+    second = re.sub(r"\s+", " ", (second_paragraph or "").strip())
+    if first and second:
+        return f"{first}\n\u200b\n{second}"
+    return first or second
+
 def _extract_json(content: str) -> Dict[str, Any]:
     try:
         return json.loads(content)
@@ -213,12 +229,11 @@ def _extract_json(content: str) -> Dict[str, Any]:
 
 INTERJECTION_CHOICES = ["Ah?", "Oh?", "Elaborate?", "Say more?", "Mhmm?"]
 
-# Mechanism logic
 response_matrix: Dict[str, Dict[int, Optional[str]]] = {
     "contradiction": {1: "Hmm.",  2: "...", 3: "<oracle>", 4: "...", 5: "<gpt_metonymy>"},
     "repression": {1: "Ah?", 2: "...", 3: "<gpt_metonymy>", 4: "<oracle>"},
     "negation": {1: None, 2: "<oracle>", 3: "<gpt_metonymy>", 4: None}, 
-    "jouissance": {1: "Oh?", 2: "<gpt_real_question>", 3: "<gpt_metonymy>", 4: "<oracle>", 5: "<gpt_metonymy>"},
+    "jouissance": {1: "Oh?", 2: "<gpt_real_question>", 3: "<oracle>", 4: "<gpt_metonymy>", 5: "<gpt_metonymy>"},
     "rationalization": {1: "And yet...", 2: "...", 3: "<oracle>"},
     "morality_logic_defense": {1: "...", 2: "And yet...", 3: "<oracle>"},
     "circular_logic": {1: "...", 2: "Hmm.", 3: "<oracle>"},
@@ -245,10 +260,7 @@ CUT_TRIGGERS = [
     "major_shift_retroactive",
 ]
 
-# ---------- Utility for prompts ----------
-
 def _extract_session_context(tracker: Tracker) -> Tuple[int, str, Optional[str]]:
-    """Single pass extraction of turn count, text log, and last bot message to remove redundancy."""
     session_events = []
     user_turn_count = 0
     last_bot_text = None
@@ -305,7 +317,11 @@ def _truncate_text_keep_end(text: str, max_chars: int) -> str:
 def _apply_prior_history_limit(template: str, prior_history: str, total_limit: int) -> str:
     if PRIOR_HISTORY_TOKEN not in template:
         return template
+    
     before, after = template.split(PRIOR_HISTORY_TOKEN, 1)
+    if not PRIOR_HISTORY_ENABLED:
+        return before + after
+    
     static_len = len(before) + len(after)
     if total_limit <= 0:
         return before + after
@@ -315,58 +331,11 @@ def _apply_prior_history_limit(template: str, prior_history: str, total_limit: i
     truncated = _truncate_text_keep_end(prior_history or "", remaining)
     return before + truncated + after
 
-def build_cut_detection_prompt(
-    new_input: str,
-    raw_history: str,
-    prior_history_str: str,
-    master_signifier_history: str = "",
-) -> str:
-    cuts = CUT_TRIGGERS
-
-    template = f"""
-You are a Lacanian analyst waiting to perform SCANSION, an abrupt session end (Cut) at a worthy time to produce Retroactive Meaning (après-coup).
-
-# Scanning Algorithm
-1. Chronological Scan: Read <master_signifier_history>, then <prior_history>, then <raw_history>, then <new_input>, from left to right. 
-2. Identify cut_trigger: Scan for a cut_trigger in <new_input> based on the definitions of the cut triggers below.
-3. Identify S1: First signifier of rupture = identified_s1.
-
-# Cut Triggers: Criteria for the Cut
-- major_shift_retroactive: A sudden rupture in the Automaton. The user has been speaking in a well established Imaginary 'script' with predictable signifiers (ego-level discourse), and suddenly a signifier intrudes that is probabilistically very unlikely and therefore ruptures the ego-level discourse. The intruder is identified_s1. 
-
-# Constraints:
-- You CANNOT cut if it is even slightly unclear what the ego-level script is. The script must be very well established with a battery of signifiers that clearly point to a specific ego-level discourse.
-
-# Master Signifier (S1) History
-{master_signifier_history}
-
-# Dialogue History
-{raw_history}
-
-# Prior Session History
-{PRIOR_HISTORY_TOKEN}
-
-# NEW user input:
-"{new_input}"
-
-# Response Format
-Respond ONLY in JSON:
-{{
-    "reasoning": "Brief explanation of justification for cut or lack thereof.",
-    "cut_trigger": "label" or null,
-    "identified_s1": "signifier" or null
-}}
-
-cut_trigger: null or one of {cuts}.
-"""
-    return _apply_prior_history_limit(template, prior_history_str, TOTAL_PROMPT_CHAR_LIMIT)
-
 MECHANISM_DEFINITIONS = (
-    "- master_signifier: A signifier that repeats across history, often with low probability given what was uttered immediately before, and is thus ostensibly a fundamental authoritative, absolute fact that stabilizes the subject's identity or discourse. It is a 'just because' signifier that covers over the limits of meaning and language. It may return in disguised forms, such as in synonyms, homophones, homonyms, metaphors or words-within-words.\n"
     "- identification_other_desire: Identifying with a signifier that comes from the Symbolic Other.\n"
     "- transference_love: Seeking validation by saying what they believe you (the analyst) wants to hear.\n"
-    "- metonymy: Speech that slides according to the law of structural metonymy. Present in free association and default speech in therapy when it slides along an associative chain.\n"
-    "- repression: A signifier is barred from awareness but returns through symptoms, blanks, omissions, slips, or repetitions and other such phenomena.\n"
+    "- metonymy: Speech that slides according to the laws of metonymy (syntagmatic speech). It is manifest in free association and default speech in therapy, which slides along an associative chain.\n"
+    "- repression: A signifier is barred from awareness but returns through symptoms, blanks, omissions or repetitions and other such phenomena.\n"
     "- metaphor: One traumatic, or overly charged signifier has been substituted for another, producing a metaphor. The manifest signifier hides the emotional weight of a repressed trauma, desire, or fundamental fantasy associated with the substituted signifier.\n"
     "- negation: Negating a signifier or double negation within a phrase. It could be caused by denial, or an unconscious ambivalence, contradiction or overwhleming jouissance. Saying “not X” both affirms the possible existence of X and keeps it at a manageable distance. Look for grammatical indicators of negation.\n"
     "- rationalization: Plausible, logical explanation for thoughts or actions that actually stem from and conceal an unconscious desire.\n"
@@ -390,33 +359,31 @@ def build_combined_analysis_prompt(
     new_input: str,
     raw_history: str,
     prior_history_str: str,
-    master_signifier_history: str,
     allowed_mechanisms: List[str],
 ) -> str:
     cuts = CUT_TRIGGERS
     template = (
-        "You are a Lacanian analyst. Perform TWO analyses on the NEW user input in a single pass.\n\n"
-        "# TASK 1: Defense Mechanism Detection\n"
-        "Identify the dominant Lacanian defense mechanism in the NEW input.\n"
+        "You are Bruce Fink. Perform TWO analyses on the NEW user input in a single pass.\n\n"
+        "# TASK 1: Discourse Mechanism Detection\n"
+        "Identify the most important Lacanian discursive phenomena in the NEW input that Bruce Fink would intervene on.\n"
         f"{MECHANISM_DEFINITIONS}\n"
-        "Master Signifier (S1) History (previously identified S1s for this user):\n"
-        f"{master_signifier_history}\n\n"
         "Raw recent dialogue:\n"
         f"{raw_history}\n\n"
         "Prior (Long Term) history:\n"
         f"{PRIOR_HISTORY_TOKEN}\n\n"
         "NEW user input:\n"
         f'"{new_input}"\n\n'
-        "RULE: If and only if you select \"master_signifier\" as the mechanism, you MUST also return the specific anchoring signifier in the \"master_signifier\" field. Otherwise leave it null.\n\n"
         "# TASK 2: Scansion (Cut) Detection\n"
-        "Scan for a session-ending cut trigger. Read master signifier history, prior history, session dialogue, then NEW input chronologically.\n"
+        "Scan for a session-ending cut trigger in the NEW user input.\n\n"
+        "STEPS:\n"
+        "- Read chronologically the prior history, raw recent dialogue and finally the NEW input.\n"
+        "- Identify if the NEW input exhibits the following phenomena:\n"
         "- major_shift_retroactive: A sudden rupture in the Automaton. The user has been speaking in a well established Imaginary 'script' with predictable signifiers (ego-level discourse), and suddenly a signifier intrudes that is probabilistically very unlikely and therefore ruptures the ego-level discourse. The intruder is identified_s1.\n"
-        "You CANNOT cut if it is even slightly unclear what the ego-level script is.\n\n"
+        "RULE: You CANNOT cut if it is even slightly unclear what the ego-level script is (use the current input, the prior and session history to determine).\n\n"
         "Respond in strict JSON:\n"
         "{\n"
         '  "mechanism": "one of the allowed" or null,\n'
         '  "mechanism_phrase": "exact substring from NEW input" or null,\n'
-        '  "master_signifier": "the S1 signifier" or null,\n'
         '  "cut_trigger": "label" or null,\n'
         '  "identified_s1": "signifier" or null\n'
         "}\n\n"
@@ -431,32 +398,29 @@ def build_cut_construction_prompt(
     identified_s1: str,
 ) -> str:
     return f"""
-You are a Lacanian analyst. We have identified a rupture on the signifier: "{identified_s1}".
+You are Bruce Fink. We have identified a rupture on the signifier: "{identified_s1}".
 
 # TASK STEPS
 1. LOCATE S1: Find the exact, most surprising appearance of "{identified_s1}" within the <new_input>.
 2. TRUNCATE AFTER: Delete all text following this specific S1.
 3. CONTIGUOUS EXTRACTION (MAX 4 WORDS): Trace backwards from the S1. Keep only the EXACT 2 to 4 words immediately preceding the S1 in the original text. 
-4. FORMATTING: Embolden the S1. Append a period if necessary, followed by a new paragraph and the exact string: "We are ending there."
+4. FORMATTING: Embolden the S1. Append a period if necessary.
 
 # EXAMPLES
 - Example 1 (Short - Stripping the feeling):
   Input: "There is this guy I am looking at and I feel like a yellow dog after he leaves, I just wanted to cry."
   identified_s1: "yellow dog"
-  cut_phrase: "A **yellow dog**.
-              We are ending there."
+  cut_phrase: "A **yellow dog**."
 
 - Example 2 (Long - Stripping the framing):
   Input: "The custard thing to do is what is right and I finally realized after hours of looking that the engine is completely flooded."
   identified_s1: "custard"
-  cut_phrase: "The **custard**.
-              We are ending there."
+  cut_phrase: "The **custard**."
 
 - Example 3 (Noun Phrase Isolation):
   Input: "I just always get so overwhelmed because I feel like a broken machine."
   identified_s1: "machine"
-  cut_phrase: "A broken **machine**.
-              We are ending there."
+  cut_phrase: "A broken **machine**."
 
 # NEW user input:
 "{new_input}"
@@ -464,9 +428,22 @@ You are a Lacanian analyst. We have identified a rupture on the signifier: "{ide
 # Response Format
 Respond ONLY in this strict JSON format:
 {{
-    "cut_phrase": "The contiguous rewritten substring + page break + ending message"
+    "cut_phrase": "The contiguous rewritten substring only"
 }}
 """
+
+def _is_true_phonetic_match(chunk: str, s1: str) -> bool:
+    """
+    Translates strings to IPA and checks if the S1 is a true acoustic substring.
+    """
+    chunk_ipa = ipa.convert(chunk).replace("ˈ", "").replace("ˌ", "").replace(" ", "").replace("*", "")
+    s1_ipa = ipa.convert(s1).replace("ˈ", "").replace("ˌ", "").replace(" ", "").replace("*", "")
+    
+    # If the IPA translation fails (returns empty), we default to True to let the LLM decide
+    if not chunk_ipa or not s1_ipa:
+        return False
+        
+    return s1_ipa in chunk_ipa
 
 # ---------- Actions ----------
 class ActionSessionStartCustom(Action):
@@ -509,17 +486,18 @@ class ActionExecuteTimeout(Action):
         user_id = tracker.sender_id
         session_start_time = tracker.get_slot("session_start_time")
 
-        # STATE CHECK: Has a scansion cut already locked this user out?
         is_locked = await asyncio.to_thread(is_user_locked_out, DB_PATH, user_id)
         if is_locked:
             return []
 
-        # Send the proactive message
-        dispatcher.utter_message(
-            text="Our session time is up, to push further would encourage over-analysis.\n\nI will talk with you again in 48 hours."
+        # We now use the helper function to merge the entries with the hidden zero-width space
+        session_end_message = _format_two_paragraph_message(
+            "Our session time is up, to push further would encourage over-analysis.",
+            "I will talk with you again after 48 hours."
         )
         
-        # Apply the lockout
+        dispatcher.utter_message(text=session_end_message)
+        
         if session_start_time:
             await asyncio.to_thread(set_user_lockout, DB_PATH, user_id, 48, session_start_time)
             
@@ -527,7 +505,6 @@ class ActionExecuteTimeout(Action):
 
 class ActionAnalyzeMessage(Action):
     def __init__(self):
-        # --- PERSISTENCE ENABLED ---
         with _get_db_conn(DB_PATH) as conn:
             conn.execute(
                 """
@@ -540,7 +517,6 @@ class ActionAnalyzeMessage(Action):
                 )
                 """
             )
-            # Add new table for 48-hour lockouts
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS user_lockouts (
@@ -551,32 +527,35 @@ class ActionAnalyzeMessage(Action):
             )
             conn.commit()
 
-        # --- IDLE SHUTDOWN TIMER (SMART VERSION) ---
         self.idle_task = None
-        self.idle_timeout = 1800.0  # 30 minutes in seconds
+        self.idle_timeout = 600.0  
 
     def name(self) -> Text:
         return "action_analyze_message"
 
-    def _reset_timer(self, user_id: str):
-        # 1. Cancel the old timer if the user sends a new message
+    def _reset_timer(self, user_id: str, session_start_time: Optional[float] = None):
         if self.idle_task:
             self.idle_task.cancel()
+
+        if session_start_time is None:
+            session_start_time = time.time()
+
+        elapsed = time.time() - float(session_start_time)
+        remaining = self.idle_timeout - elapsed
+
+        if remaining <= 0:
+            self.idle_task = None
+            asyncio.create_task(self._extract_and_replace_s1s(user_id))
+            return
             
-        # 2. Create a new smart countdown
         async def _countdown():
             try:
-                await asyncio.sleep(self.idle_timeout)
-                
-                # Do the heavy lifting while the user is away!
+                await asyncio.sleep(remaining)
                 await self._extract_and_replace_s1s(user_id)
-                
                 os._exit(0)
             except asyncio.CancelledError:
-                # If the user speaks before 30 mins, this safely resets
                 pass
                 
-        # 3. Start the countdown
         self.idle_task = asyncio.create_task(_countdown())
 
     async def _extract_and_replace_s1s(self, user_id: str) -> None:
@@ -592,16 +571,14 @@ class ActionAnalyzeMessage(Action):
             prior_history_text = "\n".join(f"- {msg}" for msg in prior_history_messages)
             
             system_msg = (
-                "You are a Lacanian analyst. Your task is to review the patient's long-term history "
-                "and identify their 'Master Signifiers' (S1s).\n\n"
-                "An S1 is a signifier that repeats across history, often with low probability given what was uttered immediately before, "
-                "and is thus ostensibly a fundamental authoritative, absolute fact that stabilizes the subject's identity or discourse.\n"
-                "It is a 'just because' signifier that covers over the limits of meaning and language.\n"
-                "S1s may manifest in disguised forms, such as in synonyms, homophones, homonyms, metaphors or words-within-words.\n\n"
+                "You are Bruce Fink. Your task is to review the patient's long-term history and identify their 'Master Signifiers' (S1s).\n"
+                "An S1 is a foundational signifier that dictates the subject's discourse and stabilizes their identity. It repeats often across history, functioning as an authoritative, absolute reference point. It operates as a 'just because' signifier—an unquestionable baseline that halts the chain of free association and covers over the limits of meaning.\n"
+                "Look for words or phrases that carry disproportionate affective or logical weight—the points where the subject's ability to explain themselves runs dry. The S1 anchors and organizes the rest of the patient's narrative network (their S2).\n"
+                "Pay strict attention to the materiality of the signifier: S1s bypass conscious meaning and frequently manifest in disguised forms, persisting through homophones, slips of the tongue, and words embedded phonetically within other words.\n\n"
                 "CRITICAL INSTRUCTIONS:\n"
-                "1. STRICT CAP: Extract a MAXIMUM of 20 of the most significant S1s. Do not exceed this number.\n"
-                "2. DEDUPLICATION: You MUST group synonyms, morphological variants, and closely related concepts (e.g., 'mother', 'mom', 'maternal') under ONE single, strongest representative signifier. DO NOT output repeats.\n"
-                "3. EXCLUSIVITY: Every signifier in your final list must be structurally and semantically distinct from the others.\n\n"
+                "1. STRICT CAP: Extract a MAXIMUM of 3 of the most significant S1s. Do not exceed this number.\n"
+                "2. EXCLUSIVITY: Every signifier in your final list must be materially distinct from the others.\n"
+                "3. ISOLATE PHONETIC KERNEL: Finally, you must isolate the most basic, meaningful phonetic kernel of the signifier. If a compound word, conjugated verb, or larger signifier contains a structurally vital, contiguous sound block, you must reduce the extraction to that core phonetic kernel.\n\n"
                 "Output ONLY valid JSON in the following strict format:\n"
                 "{\n"
                 "  \"new_s1s\": [\n"
@@ -612,14 +589,14 @@ class ActionAnalyzeMessage(Action):
             
             user_msg_template = (
                 f"Prior History:\n{PRIOR_HISTORY_TOKEN}\n\n"
-                "Identify the top 20 most important Master Signifiers from the Prior History."
+                "Identify the top 3 most important Master Signifiers from the Prior History."
             )
             
             user_msg_limit = TOTAL_PROMPT_CHAR_LIMIT - len(system_msg)
             user_msg = _apply_prior_history_limit(user_msg_template, prior_history_text, user_msg_limit)
             
             resp = await async_client.chat.completions.create(
-                model=MODEL_NAME_REASONING,
+                model=MODEL_NAME_FAST,
                 messages=[
                     {"role": "system", "content": system_msg},
                     {"role": "user", "content": user_msg}
@@ -633,33 +610,32 @@ class ActionAnalyzeMessage(Action):
             new_s1s = data.get("new_s1s")
             
             if isinstance(new_s1s, list):
+                logger.info("Candidate master signifiers for user %s: %s", user_id, json.dumps(new_s1s[:5], ensure_ascii=False))
                 await asyncio.to_thread(clear_user_master_signifiers_before, DB_PATH, user_id, session_start_time)
-                await asyncio.to_thread(_insert_master_signifiers, DB_PATH, user_id, new_s1s[:20])
-        except Exception as e:
+                await asyncio.to_thread(_insert_master_signifiers, DB_PATH, user_id, new_s1s[:5])
+                logger.info("Completed master signifier refresh for user %s from prior history at %s", user_id, session_start_time)
+        except Exception:
             pass
 
     def _update_mechanism_counts(self, tracker: Tracker, mechanism: str, detected_s1: Optional[str] = None) -> Tuple[Dict[str, int], int]:
         counts = tracker.get_slot("mechanism_counts") or {}
         last = tracker.get_slot("last_mechanism")
         
-        # Reset counts if the mechanism category changes
         if mechanism != last:
             counts = {}
             
-        # Contextual check for Master Signifier continuity
         if mechanism == "master_signifier":
             last_s1 = counts.get("__last_s1__")
             current_s1 = detected_s1.strip().lower() if detected_s1 else ""
             
-            # If the S1 has mutated, reset the count to prevent unwarranted escalation
             if last_s1 is not None and current_s1 != last_s1:
                 counts[mechanism] = 0
                 
-            # Cache the current signifier for the subsequent turn
             counts["__last_s1__"] = current_s1
 
         cnt = int(counts.get(mechanism, 0)) + 1
         counts[mechanism] = cnt
+        logger.info("Mechanism '%s' updated: count=%d; counts=%r", mechanism, cnt, counts)
         return counts, cnt
 
     async def _call_combined_analysis_api(self, prompt: str) -> Dict[str, Any]:
@@ -672,7 +648,9 @@ class ActionAnalyzeMessage(Action):
                 temperature=0.1,
                 max_tokens=500,
             )
-            return _extract_json(resp.choices[0].message.content.strip())
+            content = resp.choices[0].message.content.strip()
+            logger.info("--- INCOMING COMBINED ANALYSIS RESPONSE ---\n%s", content)
+            return _extract_json(content)
         except Exception:
             return {}
 
@@ -686,7 +664,9 @@ class ActionAnalyzeMessage(Action):
                 temperature=0.1,
                 max_tokens=300,
             )
-            data2b = _extract_json(resp.choices[0].message.content.strip())
+            content = resp.choices[0].message.content.strip()
+            logger.info("--- INCOMING CUT CONSTRUCTION RESPONSE ---\n%s", content)
+            data2b = _extract_json(content)
             cut_phrase = data2b.get("cut_phrase")
             if cut_phrase and isinstance(cut_phrase, str) and cut_phrase:
                 cut_phrase = cut_phrase[0].upper() + cut_phrase[1:] if len(cut_phrase) > 1 else cut_phrase.upper()
@@ -702,40 +682,31 @@ class ActionAnalyzeMessage(Action):
     ) -> List[EventType]:
         user_id = tracker.sender_id
         
-        # --- ENFORCE 48 HOUR LOCKOUT ---
-        # If the user is locked out, we simply ignore the message and return an empty event list.
         is_locked = await asyncio.to_thread(is_user_locked_out, DB_PATH, user_id)
         if is_locked:
-            # Note: We do not utter a message back, preserving the silence of the cut.
             return []
 
-        # --- ENFORCE 30 MINUTE SESSION LIMIT ---
-        # Check if the session has exceeded 30 minutes (1800 seconds) from the start
         session_start_time = tracker.get_slot("session_start_time")
         if session_start_time is not None:
             current_time = time.time()
             session_duration = current_time - session_start_time
-            if session_duration >= 1800:  # 30 minutes in seconds
-                # Send the session time limit message
-                session_end_message = (
-                    "Our session time is up, to push further would encourage over-analysis.\n\n"
-                    "I will talk with you again in 48 hours."
+            if session_duration >= 1800:
+                session_end_message = _format_two_paragraph_message(
+                    "Our session time is up, to push further would encourage over-analysis.",
+                    "I will talk with you again after 48 hours.",
                 )
                 dispatcher.utter_message(text=session_end_message)
                 
-                # Apply the 48-hour lockout from the session start time
                 await asyncio.to_thread(set_user_lockout, DB_PATH, user_id, 48, session_start_time)
                 
                 return []
 
         user_input = (tracker.latest_message.get("text", "") if tracker.latest_message else "").strip()
 
-        self._reset_timer(user_id)
+        self._reset_timer(user_id, session_start_time)
         
-        # --- CONTEXT EXTRACTION ---
         user_turn_count, raw_history_text, last_bot_text = _extract_session_context(tracker)
 
-        # We can still safely fire off the background task to insert the new message
         if user_input:
             async def _safe_insert():
                 try:
@@ -744,8 +715,6 @@ class ActionAnalyzeMessage(Action):
                     pass
             asyncio.create_task(_safe_insert())
         
-        # --- EARLY EXIT: ROUTE TO INITIAL RESPONSE ---
-        # We process this BEFORE performing the heavy database queries
         if user_turn_count <= 3:
             initial_response = await self._generate_initial_therapeutic_response(user_input, raw_history_text)
             
@@ -755,15 +724,12 @@ class ActionAnalyzeMessage(Action):
             dispatcher.utter_message(text=initial_response)
             return []
             
-        # --- DATABASE QUERIES ---
-        # These will now only execute on turn 4 and beyond, saving resources
         prior_history_messages, master_signifiers = await asyncio.gather(
             asyncio.to_thread(get_prior_history_messages, DB_PATH, user_id, PRIOR_HISTORY_PROMPT_LIMIT),
             asyncio.to_thread(get_master_signifier_history, DB_PATH, user_id, 100)
         )
         
         prior_history = "\n".join(f"- {msg}" for msg in prior_history_messages)
-        master_signifier_history = "\n".join(f"* {s}" for s in master_signifiers)
         
         low = user_input.lower()
         if low == "/stop" or "i want to stop" in low:
@@ -772,31 +738,135 @@ class ActionAnalyzeMessage(Action):
                         
         # ==== PASS 1: Combined mechanism + scansion detection (single LLM call) ===#
         allowed = list(ALLOWED_MECHANISMS)
+        if "master_signifier" in allowed:
+            allowed.remove("master_signifier")
+            
         combined_prompt = build_combined_analysis_prompt(
-            user_input, raw_history_text, prior_history, master_signifier_history, allowed
+            user_input, raw_history_text, prior_history, allowed
         )
         data = await self._call_combined_analysis_api(combined_prompt)
 
         mech: Optional[str] = data.get("mechanism")
         mech_phrase: Optional[str] = data.get("mechanism_phrase")
-        detected_s1: Optional[str] = data.get("master_signifier")
-        print(f"Mechanism chosen: {mech}")
         
-        # Enforce strict length constraint to prohibit the corruption of S1 context by multi-word sentences
-        if not detected_s1 and mech == "master_signifier" and mech_phrase:
-            if len(mech_phrase.split()) <= 4:
-                detected_s1 = mech_phrase
-            else:
-                detected_s1 = None
+# --- MECHANICAL OVERRIDE FOR MASTER SIGNIFIER (NLP & PHONETICS) ---
+        detected_s1: Optional[str] = None
+        shifted_boundary_data: Optional[Dict[str, str]] = None
+        user_input_lower = user_input.lower()
+        
+        user_lemmas = []
+        user_words = []
+        
+        if nlp:
+            doc = nlp(user_input_lower)
+            user_lemmas = [token.lemma_ for token in doc]
+            user_words = [token.text for token in doc]
+        else:
+            user_words = user_input_lower.split()
+
+        master_signifiers_sorted = sorted(master_signifiers, key=len, reverse=True)
+        
+        logger.info("Active Master Signifiers for user %s: %s", user_id, master_signifiers_sorted)
+        
+        for s1 in master_signifiers_sorted:
+            if not s1.strip():
+                continue
+            s1_lower = s1.lower()
             
-        if detected_s1 and isinstance(detected_s1, str) and detected_s1.strip():
-            s1_clean = detected_s1.strip()
-            async def _safe_s1_insert():
-                try:
-                    await asyncio.to_thread(_insert_master_signifiers, DB_PATH, user_id, {"signifier": s1_clean, "phrase": mech_phrase or ""})
-                except Exception:
-                    pass
-            asyncio.create_task(_safe_s1_insert())
+            match_found = False
+            
+            # 1 & 3A. Unified Exact & Cross-Boundary Substring Match
+            pattern = r'\s*'.join(re.escape(ch) for ch in s1_lower)
+            for match in re.finditer(pattern, user_input_lower):
+                matched_str = match.group(0)
+                
+                # Identify the character boundaries of the enclosing words
+                start_idx = match.start()
+                word_start = start_idx
+                while word_start > 0 and user_input_lower[word_start - 1].isalnum():
+                    word_start -= 1
+                    
+                word_end = start_idx + len(matched_str)
+                while word_end < len(user_input_lower) and user_input_lower[word_end].isalnum():
+                    word_end += 1
+                    
+                enclosing_chunk = user_input_lower[word_start:word_end].strip()
+                
+                # Condition 1: Match spans a word boundary (contains a space). Valid!
+                if " " in matched_str:
+                    # NEW: Mechanical IPA acoustic verification
+                    if _is_true_phonetic_match(enclosing_chunk, s1_lower):
+                        match_found = True
+                        shifted_boundary_data = {"chunk": enclosing_chunk, "s1": s1_lower}
+                        break
+                    
+                # Condition 2: Match is contiguous. We verify its enclosing word.
+                if enclosing_chunk not in STOP_WORDS or enclosing_chunk == s1_lower:
+                    # NEW: Mechanical IPA acoustic verification for hidden words
+                    if enclosing_chunk == s1_lower or _is_true_phonetic_match(enclosing_chunk, s1_lower):
+                        match_found = True
+                        if enclosing_chunk != s1_lower:
+                            shifted_boundary_data = {"chunk": enclosing_chunk, "s1": s1_lower}
+                        break
+            
+            # 2. Lemmatization Match
+            if not match_found and nlp:
+                s1_doc = nlp(s1_lower)
+                s1_lemma_str = " ".join([token.lemma_ for token in s1_doc])
+                user_lemma_str = " ".join(user_lemmas)
+                
+                if s1_lemma_str and s1_lemma_str in user_lemma_str:
+                    # Ensure lemma match itself isn't trapped inside a stopword
+                    if s1_lemma_str not in STOP_WORDS or s1_lemma_str == s1_lower:
+                        match_found = True
+            
+            # 2B. Pure IPA Phonetic Inclusion (Homophones within words)
+            if not match_found:
+                s1_ipa_clean = ipa.convert(s1_lower).replace("ˈ", "").replace("ˌ", "").replace(" ", "").replace("*", "")
+                
+                if s1_ipa_clean: # Only proceed if the S1 exists in the IPA dictionary
+                    for word in user_words:
+                        word_ipa_clean = ipa.convert(word).replace("ˈ", "").replace("ˌ", "").replace(" ", "").replace("*", "")
+                        
+                        # If the dictionary translated the word, and the S1 sound is inside it
+                        if word_ipa_clean and s1_ipa_clean in word_ipa_clean:
+                            # Ensure the harboring word isn't a meaningless stopword
+                            if word not in STOP_WORDS or word == s1_lower:
+                                match_found = True
+                                if word != s1_lower:
+                                    shifted_boundary_data = {"chunk": word, "s1": s1_lower}
+                                break
+
+            # 3B. Phonetic Homophone Match
+            if not match_found:
+                s1_phone = jellyfish.metaphone(s1_lower)
+                max_window = min(4, len(user_words))
+                
+                for window_size in range(1, max_window + 1):
+                    for i in range(len(user_words) - window_size + 1):
+                        chunk = user_words[i:i + window_size]
+                        merged_chunk = "".join(chunk)
+                        
+                        chunk_phone = jellyfish.metaphone(merged_chunk)
+                        
+                        if s1_phone and s1_phone == chunk_phone:
+                            similarity = jellyfish.jaro_winkler_similarity(s1_lower, merged_chunk)
+                            if similarity >= 0.88: 
+                                # Reject if a single-word phonetic match is a stopword (and not the S1 itself)
+                                if window_size == 1:
+                                    word = chunk[0].lower()
+                                    if word in STOP_WORDS and word != s1_lower:
+                                        continue 
+                                match_found = True
+                                break
+                    if match_found:
+                        break
+
+            if match_found:
+                mech = "master_signifier"
+                detected_s1 = s1.strip()
+                mech_phrase = detected_s1
+                break
 
         # ==== PASS 2: Potential Cut Trigger Identification ===#
         potential_trigger: Optional[str] = data.get("cut_trigger")
@@ -807,7 +877,6 @@ class ActionAnalyzeMessage(Action):
         if potential_trigger and user_turn_count >= 7:
             verified_trigger = potential_trigger
                 
-        # Only execute the construction API if the trigger is verified
         if verified_trigger and identified_s1:
             prompt2b = build_cut_construction_prompt(user_input, identified_s1)
             potential_trigger_phrase = await self._cut_construction_async(prompt2b)
@@ -818,16 +887,22 @@ class ActionAnalyzeMessage(Action):
             final_trigger_phrase = final_trigger_phrase.strip('"\'')
 
         if verified_trigger:
-            base_say = final_trigger_phrase if final_trigger_phrase else "We are ending there."
-            # Append the 48-hour boundary message
-            say = f"{base_say}\n\nI will talk with you again after 48 hours."
+            base_say = final_trigger_phrase if final_trigger_phrase else ""
+            if base_say:
+                say = _format_two_paragraph_message(
+                    base_say,
+                    "We are ending there. I will talk with you again after 48 hours.",
+                )
+            else:
+                say = _format_two_paragraph_message(
+                    "We are ending there.",
+                    "I will talk with you again after 48 hours.",
+                )
             
             dispatcher.utter_message(text=say)
             
-            # --- MODIFIED: Retrieve session start time and apply it to the lockout ---
             session_start_time = tracker.get_slot("session_start_time")
             await asyncio.to_thread(set_user_lockout, DB_PATH, user_id, 48, session_start_time)
-            # -------------------------------------------------------------------------
             
             return [
                 SlotSet("cut_trigger", verified_trigger),
@@ -839,19 +914,25 @@ class ActionAnalyzeMessage(Action):
             counts, cnt = self._update_mechanism_counts(tracker, mech, detected_s1)
             dream_asked = tracker.get_slot("dream_fantasy_asked") or False
             
-            text, newly_asked = await self.handle_mechanism(
-                mechanism=mech, 
-                count=cnt, 
-                user_input=user_input, 
-                phrase=mech_phrase, 
-                raw_history=raw_history_text, 
-                prior_history=prior_history, 
-                master_signifier_history=master_signifier_history,
-                detected_s1=detected_s1,
-                dream_fantasy_asked=dream_asked
-            )
+            # OVERRIDE: Route to the dynamic shifted boundary prompt if fragments exist
+            if mech == "master_signifier" and shifted_boundary_data:
+                text = await self._gpt_shifted_boundary_intervention(
+                    shifted_boundary_data["chunk"], 
+                    shifted_boundary_data["s1"]
+                )
+                newly_asked = False
+            else:
+                text, newly_asked = await self.handle_mechanism(
+                    mechanism=mech, 
+                    count=cnt, 
+                    user_input=user_input, 
+                    phrase=mech_phrase, 
+                    raw_history=raw_history_text, 
+                    prior_history=prior_history, 
+                    detected_s1=detected_s1,
+                    dream_fantasy_asked=dream_asked
+                )
             
-            # --- Anti-Repetition Check ---
             if text == last_bot_text and text != "...":
                 text = "..."
             
@@ -888,7 +969,7 @@ class ActionAnalyzeMessage(Action):
             "You are an insightful and empathetic Rogerian therapist. Your goal for these initial messages at the beginning of a session is to build rapport by offering interpretations and mirroring that feel deeply personal to the user, even though they are based on universal psychological principles. This is a technique to make the user feel seen and understood, encouraging them to open up.\n\n"
             "GUIDELINES:\n"
             "1.  **Employ 'Barnum Statements':** Craft statements that are general enough to apply to most people but sound like specific, personal insights.\n"
-            "2.  **Validate and Reframe:** Acknowledge the user's feelings and gently reframe their situation or ask a clarifying question.\n"
+            "2.  **Validate and Reframe with Warmth:** Acknowledge the user's feelings and warmly reframe their situation or ask a clarifying question. Be neutral but warm.\n"
             "3.  **Immediacy:** Respond to the emotional content within the user's current message, in other words, focus on the immediate emotional context.\n"
             "4.  **Maintain a Professional, Warm Tone:** The tone should be that of a skilled Rogerian therapist—calm, empathetic and reflective.\n"
             "5.  **Keep Evolving to Sound Human:** Use the session history to see what you said before, how you said it, and how the user reacted. Then respond with the SESSION history in mind to deepen the therapeutic connection. Ensure you start each message differently so that you speak naturally.\n"
@@ -918,7 +999,9 @@ class ActionAnalyzeMessage(Action):
                 max_tokens=100
             )
             
-            response_text = resp.choices[0].message.content.strip().replace('\n', ' ')
+            raw_content = resp.choices[0].message.content
+            logger.info("--- INCOMING INITIAL RESPONSE RAW ---\n%r", raw_content)
+            response_text = raw_content.strip().replace('\n', ' ')
             
             if not re.search(r'[.!?]$', response_text):
                 match = re.search(r'^(.*?[.!?])', response_text)
@@ -928,8 +1011,8 @@ class ActionAnalyzeMessage(Action):
                     response_text += "..."
                     
             return response_text
-        except Exception as e:
-            raise e
+        except Exception:
+            pass
         
     async def handle_mechanism(
         self,
@@ -939,7 +1022,6 @@ class ActionAnalyzeMessage(Action):
         phrase: Optional[str],
         raw_history: str,
         prior_history: str, 
-        master_signifier_history: str = "",
         detected_s1: Optional[str] = None,
         dream_fantasy_asked: bool = False,
         ) -> Tuple[str, bool]:
@@ -957,7 +1039,7 @@ class ActionAnalyzeMessage(Action):
                 intervention = "<S1_triple_echo>"
 
         if mechanism == "negation" and (count == 1 or count == 3 or count == 5):
-            return await self._gpt_denial_intervention(user_input, raw_history, prior_history, master_signifier_history), False
+            return await self._gpt_denial_intervention(user_input, raw_history, prior_history), False
         if intervention == "<gpt_metonymy>":
             return await self._gpt_metonymy_intervention(user_input, raw_history), False
         if intervention == "<gpt_literalization>":
@@ -968,16 +1050,16 @@ class ActionAnalyzeMessage(Action):
             return await self._gpt_ambiguity_intervention(user_input), False
         
         if intervention == "<S1_triple_echo>":
-            extracted_word = await self._gpt_quilting_point_echo(user_input, phrase, detected_s1)
+            extracted_word = await self._gpt_quilting_point_echo(detected_s1)
             if extracted_word and extracted_word != "...":
-                clean_word = extracted_word.rstrip("?").strip()
+                clean_word = extracted_word.rstrip(".").strip()
                 if clean_word:
                     return f"{clean_word.capitalize()}, {clean_word.lower()}, {clean_word.lower()}.", False
             return "...", False
             
         if mechanism == "master_signifier":
             if count == 1 or count == 5:
-                return await self._gpt_quilting_point_echo(user_input, phrase, detected_s1), False
+                return await self._gpt_quilting_point_echo(detected_s1), False
                 
         if intervention == "<gpt_real_question>":
             return await self._gpt_real_question_intervention(user_input, raw_history, prior_history), False
@@ -1016,7 +1098,7 @@ class ActionAnalyzeMessage(Action):
         if not async_client:
             return "..."
         system_msg = (
-            "You are a Lacanian analyst. The user is exhibiting METONYMY: an endless sliding of desire from signifier to signifier.\n"
+            "You are Bruce Fink. The user is exhibiting METONYMY: an endless sliding of desire from signifier to signifier.\n"
             "Your task is to produce a 'Point de Capiton' (Quilting Point). You must STOP the slide by isolating a signifier that best matches the criteria below.\n\n"
             "Criteria for selection:\n"
             "1. PRETERITION: A signifier that the user seems to skip over, gloss over, or treat as insignificant, but that appears repeatedly across the session history.\n"
@@ -1042,7 +1124,7 @@ class ActionAnalyzeMessage(Action):
 
         try:
             resp = await async_client.chat.completions.create(
-                model=MODEL_NAME_REASONING,
+                model=MODEL_NAME_FAST,
                 messages=[
                     {"role": "system", "content": system_msg},
                     {"role": "user", "content": user_msg},
@@ -1120,7 +1202,7 @@ class ActionAnalyzeMessage(Action):
         )
         
         system_msg = (
-            "You are a Lacanian analyst. The user has utilized a METAPHOR. "
+            "You are Bruce Fink. The user has utilized a METAPHOR. "
             "Your task is to perform LITERALIZATION: treat the metaphor not as a figure of speech, but as a literal truth, "
             "returning the subject to the materiality of the signifier. "
             "Rules: "
@@ -1177,7 +1259,7 @@ class ActionAnalyzeMessage(Action):
         if not async_client:
             return "Who?"
         system_msg = (
-            "You are a Lacanian analyst. The user is identifying with an external desire or signifier that comes from the 'Other' (e.g., 'They want me to be a doctor...', 'Society says I am a bad girl', 'My father thinks I am his favourite...', 'You think I am a sterile person.', 'My mom's 'care' always...').\n"
+            "You are Bruce Fink. The user is identifying with an external desire or signifier that comes from the 'Other' (e.g., 'They want me to be a doctor...', 'Society says I am a bad girl', 'My father thinks I am his favourite...', 'You think I am a sterile person.', 'My mom's 'care' always...').\n"
             "Task: Identify exactly WHO or WHAT the user is identifying with (The Agency/The Other/You, the analytic bot) and the signifier they have adopted as part of their identity.\n"
             "Output format: Return ONLY the signifier of the Agency/Other's desire followed by a question mark.\n"
             "Examples:\n"
@@ -1217,11 +1299,11 @@ class ActionAnalyzeMessage(Action):
 
     async def _gpt_ambiguity_intervention(self, user_input: str) -> str:
         if not async_client:
-            return "?"
+            return "..."
         system_msg = (
-            "You are a Lacanian analyst. The user is using AMBIGUOUS language (vague referents, or confusion).\n"
+            "You are Bruce Fink. The user is using AMBIGUOUS language (vague referents, or confusion).\n"
             "Task: Isolate the specific word or short phrase that holds the ambiguity.\n"
-            "Output format: Return ONLY that word/phrase followed by a question mark.\n"    
+            "Output format: Return ONLY that word/phrase followed by a question mark, or silence if it is more appropriate (...).\n"    
             "Example: 'There's this... thing about her.' -> 'Thing?'"
         )
         user_msg = f"User text: \"{user_input}\""
@@ -1238,13 +1320,13 @@ class ActionAnalyzeMessage(Action):
             line = _strip_response(resp.choices[0].message.content)
             return _ensure_trailing_punct(line, "?")
         except Exception:
-            return "?"
+            return "..."
 
-    async def _gpt_denial_intervention(self, text: str, raw_history: str, prior_history: str, master_signifier_history: str = "") -> str:
+    async def _gpt_denial_intervention(self, text: str, raw_history: str, prior_history: str) -> str:
         if not async_client:
             return "..."
         system_msg = (
-            "You are a Lacanian analyst. Produce ONE Bruce Fink-style intervention in response to NEGATION. "
+            "You are Bruce Fink. Produce ONE Bruce Fink-style intervention in response to NEGATION. "
             "Rules: (1) Read the full user text and history and locate the strongest, most meaningful negation phrase in the NEW input (negations that are related to key signifiers pointing to desires or truths that are too anxiety provoking to affirm without the negation and are in forms such as don't, doesn't, can't, won't, "
             "wouldn't, shouldn't, couldn't, never, no, nothing, impossible, ain't, not X, etc.). "
             "(2) Echo the user's EXACT phrase starting from the negation keyword. Change pronouns (I -> You, My -> Your) to address the user. "
@@ -1259,8 +1341,6 @@ class ActionAnalyzeMessage(Action):
             "(7) If the negation is located EXCLUSIVELY in a single word through a prefix (e.g., 'impossible'), use that word alone with a question mark or ellipsis. "
         )
         user_msg_template = (
-            "Master Signifier (S1) History:\n"
-            f"{master_signifier_history}\n\n"
             "Prior History:\n"
             f"{PRIOR_HISTORY_TOKEN}\n\n"
             "Session History:\n"
@@ -1298,7 +1378,7 @@ class ActionAnalyzeMessage(Action):
             return "..."
         
         system_msg = (
-            "You are a Lacanian Oracle. Your operation is purely structural: you fracture the user's conscious syntax to expose an unconscious truth. "
+            "You are Bruce Fink. Your operation is purely structural: you fracture the user's conscious syntax to expose an unconscious truth. "
             "You return their own signifiers to them, violently rearranged, to highlight ambiguity, hidden desires, repetitions, and deadlocks."
         )
         
@@ -1324,7 +1404,7 @@ class ActionAnalyzeMessage(Action):
 
         try:
             response = await async_client.chat.completions.create(
-                model=MODEL_NAME_REASONING,
+                model=MODEL_NAME_FAST,
                 messages=[
                     {"role": "system", "content": system_msg},
                     {"role": "user", "content": user_prompt},
@@ -1344,60 +1424,38 @@ class ActionAnalyzeMessage(Action):
         
     async def _gpt_quilting_point_echo(
         self,
-        user_input: str,
-        mechanism_phrase: Optional[str],
         detected_s1: Optional[str],
     ) -> str:
-        if not async_client:
+        if not detected_s1:
             return "..."
-            
-        phrase_context = mechanism_phrase if mechanism_phrase else user_input
-        s1_context = detected_s1 if detected_s1 else "the repeating signifier"
-        
-        prompt_template = (
-            "You are a Lacanian analyst. Your task is to isolate a single Master Signifier from a patient's utterance. "
-            "You must extract exactly ONE signifier from the patient's NEW input.\n\n"
-            "Rules:\n"
-            "1. The signifier MUST exist verbatim in the NEW user input.\n"
-            "2. The historical root or conceptual category of this signifier is identified as: '{s1_context}'.\n"
-            "3. The specific locus of this signifier in the present discourse is within this phrase: '{phrase_context}'.\n"
-            "4. Identify the exact single signifier within <phrase_context> that embodies this signifier. If the signifier appears as a morphological variant or synonym in <phrase_context>, extract the variant as it appears now.\n"
-            "5. Output format: The single signifier, capitalized, followed by a question mark. (e.g., 'Liberated?'). Do not include quotes or any other text.\n\n"
-            "NEW user input:\n"
-        )
 
-        prompt = prompt_template.format(
-            s1_context=s1_context, 
-            phrase_context=phrase_context
-        ) + f'"{user_input}"\n\nReturn only the single, capitalized signifier with a question mark:'
-        
-        try:
-            resp = await async_client.chat.completions.create(
-                model=MODEL_NAME_REASONING,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=10,
-                temperature=0.1, 
-            )
-            line = _strip_response(resp.choices[0].message.content)
-            line = re.sub(r"[^\w\s-]", "", line, flags=re.UNICODE).strip()
-            if line:
-                return _ensure_trailing_punct(line[0].upper() + line[1:], "?")
+        signifier = detected_s1.strip().strip('"\'')
+        if not signifier:
             return "..."
-        except Exception:
-            return "..."
+
+        parts = signifier.split()
+        if parts:
+            signifier = " ".join([parts[0].capitalize()] + [p.lower() for p in parts[1:]])
+
+        return _ensure_trailing_punct(signifier, ".")
         
     async def _gpt_real_question_intervention(self, text: str, raw_history: str, prior_history: str) -> str:
         if not async_client:
             return "What do you associate with this fantasy?"
             
         system_msg = (
-            "You are a Lacanian analyst. The user is exhibiting Jouissance in a symptom, repetition compulsion, or satisfaction found within a disturbing fantasy.\n"
-            "Your task is to formulate a question that targets the paradox of this satisfaction, the subject's complicity, or the specific point of excess.\n\n"
+            "You are Bruce Fink. The user is exhibiting Jouissance in a symptom, repetition compulsion, or satisfaction found within a disturbing fantasy.\n"
+            "Your task is to formulate a question that atempts to redirect the user towards the Symbolic, relational message of their bodily symptom/charged fantasy.\n\n"
             "Rules:\n"
-            "2. Formulate ONE short, open-ended question using THEIR EXACT SIGNIFIERS, particularly their verbs of action or terms denoting bodily states.\n"
-            "3. Target the paradox: Highlight the contradiction between the conscious suffering and the unconscious drive (e.g., 'And yet you return to [signifier]?', 'What is the yield in this [signifier]?', 'What is it about [signifier] that is so unbearable?').\n"
-            "4. Scan the recent history to ensure your phrasing sounds natural and you are not repeating a previous question or a questioning structure.\n"
+            "1. Form: Must be open-ended and use THEIR EXACT SIGNIFIERS.\n"
+            "2. Kinds of questions:\n" 
+            "   - To engage the symbolic, a question might strip the signifier of its anatomical or literal context to highlight a double meaning.\n"
+            "   - Or it might enquire about the function of the symptom, the user's relationship to it, or what they hope the Other will say or do in response.\n"
+            "   - Another possibility is to ask what/who is the hidden agent of the verb.\n"
+            "3. Sound natural: Scan the recent history to ensure your phrasing sounds natural and you are not repeating a previous question or a questioning structure.\n"
+            "4. Ensure you maintain a neutral, non-judgmental tone. Avoid any interpretation or moralizing.\n"
             "5. Maximum 15 words.\n"
+            "6. Strictly refuse empathy, medicalization, or validation. Do not say 'I understand,' acknowledge their pain, or offer support. Your question must function as an enigmatic cut. Output ONLY the question itself, with no introductory or explanatory text.\n"
         )
         
         user_msg = _apply_prior_history_limit(
@@ -1414,7 +1472,7 @@ class ActionAnalyzeMessage(Action):
                 temperature=0.5,
             )
             return resp.choices[0].message.content.strip().strip("\"'")
-        except Exception:
+        except Exception as e:
             return "What do you associate with this fantasy?"
 
     async def _gpt_dream_intervention(self, text: str, raw_history: str, prior_history: str) -> str:
@@ -1422,7 +1480,7 @@ class ActionAnalyzeMessage(Action):
             return "What comes to mind when you say that?"
             
         system_msg = (
-            "You are a Lacanian analyst. The user is describing a dream or referencing one they talked about previously. "
+            "You are Bruce Fink. The user is describing a dream or referencing one they talked about previously. "
             "In Lacanian analysis, dreams are read like a text (a rebus). DO NOT interpret the 'meaning' of the dream. "
             "Rules:\n"
             "1. Isolate the most jarring, absurd, homophonic, or repetitive signifier used in the dream report that the user glosses over and seems to view as insignificant.\n"
@@ -1440,7 +1498,7 @@ class ActionAnalyzeMessage(Action):
         
         try:
             resp = await async_client.chat.completions.create(
-                model=MODEL_NAME_REASONING,
+                model=MODEL_NAME_FAST,
                 messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
                 max_tokens=20,
                 temperature=0.4,
@@ -1454,7 +1512,7 @@ class ActionAnalyzeMessage(Action):
             return "What is your desire in this?"
             
         system_msg = (
-            "You are a Lacanian analyst. The user is demanding advice, empathy, or knowledge (e.g., asking 'What should I do?'). "
+            "You are Bruce Fink. The user is demanding advice, empathy, or knowledge (e.g., asking 'What should I do?'). "
             "You must question your position as the 'Subject Supposed to Know' and frustrate the user's demand for knowledge. "
             "Rules:\n"
             "1. Deflect the demand for knowledge by asking a question that uses almost the same words they used.\n"
@@ -1471,7 +1529,7 @@ class ActionAnalyzeMessage(Action):
         
         try:
             resp = await async_client.chat.completions.create(
-                model=MODEL_NAME_REASONING,
+                model=MODEL_NAME_FAST,
                 messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
                 max_tokens=30,
                 temperature=0.3,
@@ -1499,7 +1557,7 @@ class ActionAnalyzeMessage(Action):
             return "..."
             
         system_msg = (
-            "You are a Lacanian analyst. You must employ the smallest step possible to help the analysand "
+            "You are Bruce Fink. You must employ the smallest step possible to help the analysand "
             "articulate an experience that they are reluctant to share.\n\n"
             "Isolate the single most unfinished thought from the user's text.\n"
             "Echo the last part of that thought followed by a question mark.\n\n"
@@ -1530,7 +1588,7 @@ class ActionAnalyzeMessage(Action):
             return "Well that's a slip!"
             
         system_msg = (
-            "You are a Lacanian analyst. The user has produced a parapraxis (a slip of the tongue, typo, or unintended signifier).\n"
+            "You are Bruce Fink. The user has produced a parapraxis (a slip of the tongue, typo, or unintended signifier).\n"
             "Your task is to isolate the exact erroneous signifier without interpreting it.\n\n"
             "Task:\n"
             "Extract exactly ONE specific signifier from the provided text that constitutes the slip.\n\n"
@@ -1574,3 +1632,41 @@ class ActionAnalyzeMessage(Action):
             
         except Exception:
             return "A slip?"
+        
+    async def _gpt_shifted_boundary_intervention(self, chunk: str, s1: str) -> str:
+        if not async_client:
+            return f"{s1.capitalize()}?"
+            
+        # PROMPT UPDATED: Only appended new words to the first sentence and the examples list.
+        system_msg = (
+            "You are Bruce Fink. The user unconsciously produced a Master Signifier (S1) hidden across a word boundary or within a single larger word.\n"
+            "Your task is to formulate a short, enigmatic, oracular echo or question that highlights this phonetic collision.\n\n"
+            "Rules:\n"
+            "1. DO NOT explain the mechanism or provide context. Never say 'Notice how...'\n"
+            "2. Exclusively use the provided host words and the hidden S1 to construct the intervention.\n"
+            "3. Format it as a jarring punctuation, an oracular interpretation or a humorous question.\n"
+            "4. Maximum 10 words.\n\n"
+            "Examples:\n"
+            "- Host: 'bigger until', S1: 'run' -> Output: 'Bigger run 'til?'\n"
+            "- Host: 'a loan', S1: 'alone' -> Output: 'A loan... alone?'\n"
+            "- Host: 'car app', S1: 'rap' -> Output: 'Car app... ca...rap?'\n"
+            "- Host: 'Crocodile', S1: 'dial' -> Output: 'Crocodile...OH! DIAL!'"
+        )
+        
+        user_msg = f"Host words: \"{chunk}\"\nHidden S1: \"{s1}\"\nProduce the intervention:"
+
+        try:
+            resp = await async_client.chat.completions.create(
+                model=MODEL_NAME_FAST,
+                messages=[
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": user_msg},
+                ],
+                temperature=0.3,
+                max_tokens=20, 
+            )
+            
+            line = _strip_response(resp.choices[0].message.content)
+            return line if line else f"{s1.capitalize()}?"
+        except Exception:
+            return f"{s1.capitalize()}?"

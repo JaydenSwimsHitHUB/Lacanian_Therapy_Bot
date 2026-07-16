@@ -15,6 +15,9 @@ RUN pip install "protobuf==3.19.6"
 # Install project-specific dependencies (including nltk)
 RUN if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
+# Download the spaCy English language model
+RUN python -m spacy download en_core_web_sm
+
 # Force Python implementation of Protobuf to avoid runtime conflicts
 ENV PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
 
@@ -31,5 +34,4 @@ USER rasa
 EXPOSE 5055
 
 # inherits ENTRYPOINT ["rasa"] from the base image
-CMD ["run", "actions", "--port", "5055"]
-
+CMD ["run", "actions", "--port", "5055", "--debug"]
