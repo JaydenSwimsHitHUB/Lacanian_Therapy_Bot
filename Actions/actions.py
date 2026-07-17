@@ -5,7 +5,9 @@ import os
 import random
 import re
 import sqlite3
+import threading
 import time
+import sys
 from contextlib import contextmanager
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Text, Tuple
@@ -31,6 +33,19 @@ STOP_WORDS = {"a", "an", "the", "and", "but", "or", "on", "in", "with", "is", "w
 # --- SETUP ENCRYPTION ---
 ENCRYPTION_KEY = os.getenv("CHAT_ENCRYPTION_KEY")
 cipher_suite = Fernet(ENCRYPTION_KEY.encode('utf-8')) if ENCRYPTION_KEY else None
+
+# --- GLOBAL ACTION SERVER MONITOR ---
+GLOBAL_LAST_ACTIVITY = time.time()
+
+def action_server_idle_monitor():
+    """Monitors global activity and kills the Action Server after 30 minutes of total silence."""
+    while True:
+        time.sleep(10)
+        elapsed = time.time() - GLOBAL_LAST_ACTIVITY
+        if elapsed > 1800.0:  # 30 minutes
+            sys.stdout.write("[MONITOR] Action server idle for 30 minutes. Initiating termination.\n")
+            sys.stdout.flush()
+            os._exit(0)
 
 def _encrypt(text: str) -> str:
     if not cipher_suite or not text:
@@ -601,36 +616,60 @@ class ActionAnalyzeMessage(Action):
             )
             conn.commit()
 
-        self.idle_task = None
-        self.idle_timeout = 1800.0  
+        # Dictionary to hold independent tasks for multiple users
+        self.idle_tasks = {}
+        
+        # Start the global infrastructure kill-switch if it hasn't been started yet
+        if not hasattr(self.__class__, '_monitor_thread_started'):
+            self.__class__._monitor_thread_started = True
+            threading.Thread(target=action_server_idle_monitor, daemon=True).start()
 
     def name(self) -> Text:
         return "action_analyze_message"
 
-    def _reset_timer(self, user_id: str, session_start_time: Optional[float] = None):
-        if self.idle_task:
-            self.idle_task.cancel()
+    def _ensure_s1_timer(self, user_id: str, session_start_time: float):
+        """Ensures a 35-minute extraction timer is running for the user. Prevents duplicates."""
+        
+        # Initialize a ledger for completed extractions if it doesn't exist yet
+        if not hasattr(self, 'completed_extractions'):
+            self.completed_extractions = set()
 
-        if session_start_time is None:
-            session_start_time = time.time()
+        # Create a unique ID for this specific session
+        session_id = f"{user_id}_{session_start_time}"
 
-        elapsed = time.time() - float(session_start_time)
-        remaining = self.idle_timeout - elapsed
+        # If we already completed this session's extraction, do nothing
+        if session_id in self.completed_extractions:
+            return
 
+        # If the timer is currently sleeping/running for this user, leave it alone
+        if user_id in self.idle_tasks and not self.idle_tasks[user_id].done():
+            return
+
+        # Calculate time remaining out of the 35-minute (2100 seconds) window
+        elapsed = time.time() - session_start_time
+        remaining = 2100.0 - elapsed
+
+        # If 35 minutes have already passed, log it as completed and execute immediately
         if remaining <= 0:
-            self.idle_task = None
+            self.completed_extractions.add(session_id)
             asyncio.create_task(self._extract_and_replace_s1s(user_id))
             return
             
         async def _countdown():
             try:
                 await asyncio.sleep(remaining)
+                # Mark as completed right before executing to prevent race conditions
+                self.completed_extractions.add(session_id)
                 await self._extract_and_replace_s1s(user_id)
-                os._exit(0)
+                
+                # Clean up the pending task dictionary after execution
+                if user_id in self.idle_tasks:
+                    del self.idle_tasks[user_id]
             except asyncio.CancelledError:
                 pass
                 
-        self.idle_task = asyncio.create_task(_countdown())
+        # Assign the un-interruptible countdown to the user
+        self.idle_tasks[user_id] = asyncio.create_task(_countdown())
 
     async def _extract_and_replace_s1s(self, user_id: str) -> None:
         if not async_client:
@@ -751,6 +790,10 @@ class ActionAnalyzeMessage(Action):
     ) -> List[EventType]:
         user_id = tracker.sender_id
         
+        # Update the global activity tracker to keep the Action Server alive
+        global GLOBAL_LAST_ACTIVITY
+        GLOBAL_LAST_ACTIVITY = time.time()
+        
         is_locked = await asyncio.to_thread(is_user_locked_out, DB_PATH, user_id)
         if is_locked:
             return []
@@ -772,7 +815,11 @@ class ActionAnalyzeMessage(Action):
 
         user_input = (tracker.latest_message.get("text", "") if tracker.latest_message else "").strip()
 
-        self._reset_timer(user_id, session_start_time)
+        # Guarantee we have a baseline time for the calculation
+        start_time_float = float(session_start_time) if session_start_time is not None else time.time()
+        
+        # Initiate the 35-minute timer (it will ignore this call if already running)
+        self._ensure_s1_timer(user_id, start_time_float)
         
         user_turn_count, raw_history_text, last_bot_text = _extract_session_context(tracker)
 
@@ -1400,11 +1447,17 @@ class ActionAnalyzeMessage(Action):
         if not signifier:
             return "..."
 
+        # --- NEW REGEX SCRUBBING STEP ---
+        # This removes any trailing commas, question marks, or symbols from the end of the word
+        signifier = re.sub(r'[^\w\s]+$', '', signifier).strip()
+        # --------------------------------
+
         parts = signifier.split()
         if parts:
             signifier = " ".join([parts[0].capitalize()] + [p.lower() for p in parts[1:]])
 
-        return _ensure_trailing_punct(signifier, ".")
+        # Directly append the full stop instead of passing it to _ensure_trailing_punct
+        return signifier + "."
         
     async def _gpt_real_question_intervention(self, text: str, raw_history: str, prior_history: str) -> str:
         if not async_client:

@@ -4,7 +4,7 @@ import threading
 import os
 import sys
 
-IDLE_TIMEOUT = 900.0  # 15 minutes in seconds
+IDLE_TIMEOUT = 120.0  # 2 minutes in seconds
 last_activity = time.time()
 state_lock = threading.Lock()
 
@@ -32,12 +32,16 @@ def run_server():
     global last_activity
     
     command = [
+        "stdbuf", "-oL", "-eL",  
         "rasa", "run", 
         "--enable-api", 
         "--cors", "*", 
         "--port", "5005", 
-        "--interface", "0.0.0.0"
+        "--interface", "0.0.0.0",
+        "--debug"  # CRITICAL: Required to expose 'Received user message' in logs
     ]
+    
+    child_env = {**os.environ, "PYTHONUNBUFFERED": "1"}
     
     # Launch Rasa as a child process, capturing stdout and stderr combined
     proc = subprocess.Popen(
@@ -45,27 +49,31 @@ def run_server():
         stdout=subprocess.PIPE, 
         stderr=subprocess.STDOUT, 
         text=True,
-        bufsize=1
+        bufsize=1,
+        env=child_env
     )
     
     # Initialize the independent watchdog thread
     monitor_thread = threading.Thread(target=timeout_checker, args=(proc,), daemon=True)
     monitor_thread.start()
 
-    # Define the signifiers that are permitted to bypass the output filter
+    # Define the signifiers that are permitted to bypass the output filter.
+    # Notice we removed "Logged UserUtterance" from here so it stays completely invisible.
     manifest_keywords = [
         "Rasa server is up", 
-        "Received user message", 
         "ERROR", 
         "WARNING"
     ]
 
     # Iterate continuously over the child process's output
     for line in iter(proc.stdout.readline, ''):
-        with state_lock:
-            last_activity = time.time()
+        
+        # 1. Silently reset the kill-switch if a human actually speaks
+        if "Logged UserUtterance" in line:
+            with state_lock:
+                last_activity = time.time()
             
-        # Conditionally manifest the log line to stdout
+        # 2. Conditionally manifest only critical startup lines or errors to stdout
         if any(keyword in line for keyword in manifest_keywords):
             sys.stdout.write(line)
             sys.stdout.flush()
