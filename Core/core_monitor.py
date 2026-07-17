@@ -4,7 +4,7 @@ import threading
 import os
 import sys
 
-IDLE_TIMEOUT = 120.0  # 2 minutes in seconds
+IDLE_TIMEOUT = 1800.0  # 30 minutes in seconds
 last_activity = time.time()
 state_lock = threading.Lock()
 
