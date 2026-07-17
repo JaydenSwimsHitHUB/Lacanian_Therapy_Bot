@@ -1,13 +1,15 @@
 import asyncio
 import datetime
 import json
+import logging
 import os
 import random
 import re
 import sqlite3
+import sys
 import threading
 import time
-import sys
+
 from contextlib import contextmanager
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Text, Tuple
@@ -25,6 +27,8 @@ from rasa_sdk.events import (
     SlotSet,
 )
 from rasa_sdk.executor import CollectingDispatcher
+
+logger = logging.getLogger(__name__)
 
 # --- STATIC STOP WORDS ---
 # A lightweight set to prevent basic articles and pronouns from triggering false positive homophones.
@@ -721,8 +725,9 @@ class ActionAnalyzeMessage(Action):
             content = resp.choices[0].message.content.strip()
             data = _extract_json(content)
             new_s1s = data.get("new_s1s")
-            
+
             if isinstance(new_s1s, list):
+                logger.info(f"Extraction complete. Found {len(new_s1s)} master signifiers.")
                 await asyncio.to_thread(clear_user_master_signifiers_before, DB_PATH, user_id, session_start_time)
                 await asyncio.to_thread(_insert_master_signifiers, DB_PATH, user_id, new_s1s[:5])
         except Exception:
